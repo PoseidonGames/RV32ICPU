@@ -1,0 +1,12 @@
+# Claude Code settings (contains API keys)
+.claude/settings.json
+
+# Simulation artifacts
+sim/*.vcd
+sim/*.vpd
+sim/*.fsdb
+sim/*.log
+
+# Build artifacts
+*.o
+*.d
