@@ -7,7 +7,7 @@
 - **Architecture:** 3-stage pipeline (IF → EX → WB), FF register file, no SRAM, no caches
 
 ## Current State
-- **Done:** alu.sv (QC REVISE — needs localparam names, _i/_o suffixes, header), regfile.sv
+- **Done:** alu.sv (QC PASS), regfile.sv
 - **Next:** imm_gen.sv → control_decoder.sv → alu_control.sv → branch_comparator.sv → datapath_m0.sv
 - **Milestones:** M0 (single-cycle, ~Apr 18) → M1 (pipeline, ~May 1) → M2a (bit-manip) → M2b (MAC stretch)
 
@@ -24,6 +24,7 @@ Per-module flow: RTL agent writes → QC agent reviews (isolated) → fix loop �
 - `docs/canonical-reference.md` — SINGLE SOURCE OF TRUTH for all encodings and interfaces
 - `docs/conventions.md` — RTL naming, port suffixes, synthesizability rules (from EE599)
 - `docs/gotchas.md` — 10 RISC-V implementation pitfalls shared across all agents
+- **Obsidian vault:** `/Users/bcable/Library/Mobile Documents/iCloud~md~obsidian/Documents/Starfall/TSI` — project notes, decisions, and design context (read on demand)
 
 ## Hard Constraints
 - **NDA:** Never paste 180nm PDK data (.lib, .lef, .spf, .tf) into any AI tool
