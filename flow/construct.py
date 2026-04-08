@@ -26,7 +26,7 @@ def construct():
   # Parameters
   #-----------------------------------------------------------------------
 
-  adk_name = 'tsmc-180nm'  # TODO: confirm exact ChipsHub ADK name
+  adk_name = 'freepdk-45nm'  # swap to tsmc-180nm when ChipsHub PDK is ready
   adk_view = 'view-standard'
 
   parameters = {
@@ -52,8 +52,9 @@ def construct():
   # Custom steps (we own these)
 
   rtl         = Step( this_dir + '/rtl'         )
-  testbench   = Step( this_dir + '/testbench'   )
   constraints = Step( this_dir + '/constraints' )
+  # testbench step exists in flow/testbench/ but is not wired into the
+  # graph until we confirm the ChipsHub VCS sim node name.
 
   # Default steps (provided by the flow)
 
@@ -82,7 +83,6 @@ def construct():
 
   g.add_step( info           )
   g.add_step( rtl            )
-  g.add_step( testbench      )
   g.add_step( constraints    )
   g.add_step( dc             )
   g.add_step( iflow          )
