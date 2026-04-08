@@ -1,12 +1,15 @@
 # Spec Agent — Canonical Reference
 
 > **Purpose:** This is the single source of truth for the RV32I processor design. Every encoding, signal definition, and architectural decision lives here.
-> **Last updated:** April 1, 2026
+> **Last updated:** April 8, 2026
 
+> **M0 SCOPE (confirmed by ar, April 2026):** instruction → decode → regfile read → ALU → regfile writeback. No PC, no instruction memory, no data memory, no branches, no loads/stores, no hazard logic. Modules: alu.sv, regfile.sv, imm_gen.sv, control_decoder.sv, alu_control.sv, datapath_m0.sv.
+>
 > **⚠ UNRESOLVED ITEMS** (do not treat as settled until confirmed with ar):
 > - Custom instruction set beyond POPCOUNT + BREV is TBD (CLZ vs BEXT vs BDEP)
 > - M1 scope: vanilla RV32I only, or includes custom extensions?
 > - ALU encoding table is authoritative for base RV32I; extension encodings (1010+) may change
+> - Halt pin: single `halt` output = OR(halt_o, illegal_instr_o), or two separate pads? (not blocking M0)
 
 ---
 
@@ -55,9 +58,15 @@
 
 | Instruction | funct3 | Operation | alu_ctrl | Notes |
 |-------------|--------|-----------|----------|-------|
-| SB          | 000    | mem[rs1+imm][7:0] = rs2[7:0]   | 4'b0000 | ALU computes address. Store data = rs2. |
-| SH          | 001    | mem[rs1+imm][15:0] = rs2[15:0] | 4'b0000 | ⚠ S-type has NO rd — imm split across funct7+rd fields |
-| SW          | 010    | mem[rs1+imm][31:0] = rs2[31:0] | 4'b0000 | |
+| SB          | 000    | mem[rs1+imm][7:0] = rs2[7:0]   | 4'b0000 | Store data placed in byte lane matching addr[1:0]. data_we = 4'b0001 << addr[1:0] |
+| SH          | 001    | mem[rs1+imm][15:0] = rs2[15:0] | 4'b0000 | ⚠ S-type has NO rd — imm split across funct7+rd fields. data_we = addr[1] ? 4'b1100 : 4'b0011 |
+| SW          | 010    | mem[rs1+imm][31:0] = rs2[31:0] | 4'b0000 | data_we = 4'b1111 |
+
+**Memory interface decisions (confirmed by ar, April 2026):**
+- `data_we[3:0]` is **active-high**, one bit per byte lane (AXI/AMBA convention)
+- Store data is **byte-lane-aligned**: byte goes in the lane matching its address, not shifted to [7:0]
+- Load extension (sign/zero) happens **inside the core**
+- **Misaligned access is undefined behavior** — no trap logic required
 
 ### 1.5 Branch Instructions (opcode = 1100011)
 
@@ -113,7 +122,7 @@ Branch target = PC + sext(B-imm). Offset is in multiples of 2 bytes (±4 KiB ran
 | 1110011      | I    | ECALL, EBREAK |
 | **0001011**  | **R** | **CUSTOM-0 (reserved for M2a/M2b extensions)** |
 
-Any opcode not in this table → `illegal_instr = 1`.
+Any opcode not in this table → `illegal_instr_o = 1`. ECALL/EBREAK → `halt_o = 1` (not `illegal_instr_o`).
 
 ---
 
@@ -148,7 +157,7 @@ J-type:  [31 imm[20] | 30:21 imm[10:1] | 20 imm[11] | 19:12 imm[19:12] | 11:7 rd
 
 | alu_ctrl [3:0] | Operation | Used by |
 |----------------|-----------|---------|
-| 4'b0000        | ADD       | R-type ADD, all loads, all stores, ADDI, AUIPC addr calc |
+| 4'b0000        | ADD       | R-type ADD, all loads, all stores, ADDI, LUI (0+U-imm), AUIPC (PC+U-imm), JAL target (PC+J-imm), JALR target (rs1+I-imm), FENCE/ECALL/EBREAK (safe default) |
 | 4'b0001        | SUB       | R-type SUB |
 | 4'b0010        | AND       | R-type AND, ANDI |
 | 4'b0011        | OR        | R-type OR, ORI |
@@ -174,40 +183,45 @@ Codes 4'b1010 through 4'b1111 are **reserved for M2a/M2b custom extensions**.
 | `mem_write`     | 1     | Enable memory write (stores) |
 | `mem_to_reg`    | 1     | Writeback source: 0=ALU result, 1=memory data |
 | `alu_src`       | 1     | ALU operand B: 0=rs2, 1=immediate |
+| `alu_src_a`     | 2     | ALU operand A: 00=rs1, 01=PC (AUIPC/JAL), 10=zero (LUI) |
 | `branch`        | 1     | Instruction is a conditional branch |
 | `jump`          | 1     | Instruction is JAL or JALR |
 | `alu_op`        | 2     | ALU operation category |
 | `imm_type`      | 3     | Immediate format selector (see §4) |
-| `pc_to_alu`     | 1     | ALU operand A: 0=rs1, 1=PC (for AUIPC) |
 | `jalr`          | 1     | Distinguishes JALR from JAL (for PC source mux) |
-| `illegal_instr` | 1     | Unrecognized opcode → halt/trap |
+| `halt`          | 1     | ECALL/EBREAK — assert halt/trap pin |
+| `illegal_instr` | 1     | Unrecognized opcode (not ECALL/EBREAK) |
 
 ### 6.2 ALU Operation Categories
 
 | alu_op [1:0] | Meaning | ALU control derivation |
 |--------------|---------|----------------------|
-| 2'b00        | ADD (for loads/stores/AUIPC/LUI) | alu_ctrl = 4'b0000 always |
-| 2'b01        | BRANCH (comparison) | Not used — branch comparator is separate |
+| 2'b00        | ADD (loads/stores/LUI/AUIPC/JAL/JALR/FENCE/ECALL/EBREAK) | alu_ctrl = 4'b0000 always |
+| 2'b01        | BRANCH | alu_control must output alu_ctrl=4'b0000 (ADD) as safe default; ALU result discarded — branch comparator handles comparison |
 | 2'b10        | R-type operation | alu_ctrl derived from funct3 + funct7 |
 | 2'b11        | I-type operation | alu_ctrl derived from funct3 + imm[10] for shifts |
 
 ### 6.3 Control Signal Truth Table
 
-| Opcode    | Instruction Class | reg_write | mem_read | mem_write | mem_to_reg | alu_src | branch | jump | alu_op | imm_type | pc_to_alu | jalr |
-|-----------|-------------------|-----------|----------|-----------|------------|---------|--------|------|--------|----------|-----------|------|
-| 0110011   | R-type ALU        | 1         | 0        | 0         | 0          | 0       | 0      | 0    | 10     | xxx      | 0         | 0    |
-| 0010011   | I-type ALU        | 1         | 0        | 0         | 0          | 1       | 0      | 0    | 11     | 000 (I)  | 0         | 0    |
-| 0000011   | Loads             | 1         | 1        | 0         | 1          | 1       | 0      | 0    | 00     | 000 (I)  | 0         | 0    |
-| 0100011   | Stores            | 0         | 0        | 1         | x          | 1       | 0      | 0    | 00     | 001 (S)  | 0         | 0    |
-| 1100011   | Branches          | 0         | 0        | 0         | x          | 0       | 1      | 0    | 01     | 010 (B)  | 0         | 0    |
-| 1101111   | JAL               | 1         | 0        | 0         | 0          | x       | 0      | 1    | xx     | 100 (J)  | 0         | 0    |
-| 1100111   | JALR              | 1         | 0        | 0         | 0          | 1       | 0      | 1    | 00     | 000 (I)  | 0         | 1    |
-| 0110111   | LUI               | 1         | 0        | 0         | 0          | 1       | 0      | 0    | 00     | 011 (U)  | 0         | 0    |
-| 0010111   | AUIPC             | 1         | 0        | 0         | 0          | 1       | 0      | 0    | 00     | 011 (U)  | 1         | 0    |
-| 0001111   | FENCE             | 0         | 0        | 0         | x          | x       | 0      | 0    | xx     | xxx      | 0         | 0    |
-| 1110011   | ECALL/EBREAK      | 0         | 0        | 0         | x          | x       | 0      | 0    | xx     | xxx      | 0         | 0    |
+| Opcode    | Instruction Class | reg_write | mem_read | mem_write | mem_to_reg | alu_src | branch | jump | alu_op | imm_type | alu_src_a | jalr | halt |
+|-----------|-------------------|-----------|----------|-----------|------------|---------|--------|------|--------|----------|-----------|------|------|
+| 0110011   | R-type ALU        | 1         | 0        | 0         | 0          | 0       | 0      | 0    | 10     | xxx      | 00        | 0    | 0    |
+| 0010011   | I-type ALU        | 1         | 0        | 0         | 0          | 1       | 0      | 0    | 11     | 000 (I)  | 00        | 0    | 0    |
+| 0000011   | Loads             | 1         | 1        | 0         | 1          | 1       | 0      | 0    | 00     | 000 (I)  | 00        | 0    | 0    |
+| 0100011   | Stores            | 0         | 0        | 1         | x          | 1       | 0      | 0    | 00     | 001 (S)  | 00        | 0    | 0    |
+| 1100011   | Branches          | 0         | 0        | 0         | x          | 0       | 1      | 0    | 01     | 010 (B)  | 00        | 0    | 0    |
+| 1101111   | JAL               | 1         | 0        | 0         | 0          | 1       | 0      | 1    | 00     | 100 (J)  | 01 (PC)   | 0    | 0    |
+| 1100111   | JALR              | 1         | 0        | 0         | 0          | 1       | 0      | 1    | 00     | 000 (I)  | 00        | 1    | 0    |
+| 0110111   | LUI               | 1         | 0        | 0         | 0          | 1       | 0      | 0    | 00     | 011 (U)  | 10 (zero) | 0    | 0    |
+| 0010111   | AUIPC             | 1         | 0        | 0         | 0          | 1       | 0      | 0    | 00     | 011 (U)  | 01 (PC)   | 0    | 0    |
+| 0001111   | FENCE             | 0         | 0        | 0         | x          | x       | 0      | 0    | 00     | xxx      | 00        | 0    | 0    |
+| 1110011   | ECALL/EBREAK      | 0         | 0        | 0         | x          | x       | 0      | 0    | 00     | xxx      | 00        | 0    | 1    |
 
-**Notes on LUI:** The ALU computes `0 + U-imm` (effectively a pass-through of the upper immediate). The `alu_src=1` selects the immediate, and since `alu_op=00` forces ADD with `alu_ctrl=4'b0000`, the ALU input A should be zero. Implementation options: (a) feed the immediate through the ALU with rs1 forced to 0 via alu_src_a mux, or (b) add a dedicated `lui` signal. Option (a) is simpler — just ensure the ALU's A-input mux can select 0 or PC in addition to rs1.
+`illegal_instr_o=1` for any opcode not in this table (driven by control_decoder default case).
+
+**Notes on LUI:** The ALU computes `0 + U-imm`. `alu_src_a=10` (zero) selects zero for ALU-A; `alu_src=1` selects the U-immediate for ALU-B; `alu_op=00` forces ADD → result = U-imm, written to rd. The datapath ALU-A mux must implement the three-input structure: `00`=rs1, `01`=PC, `10`=zero (decided April 2026).
+
+**Notes on JAL:** The ALU computes the jump target: `PC + sext(J-imm)` via `alu_src_a=01` (PC) and `alu_src=1` (J-imm). The link address (PC+4) written to rd comes from the dedicated PC+4 adder — the datapath writeback mux selects PC+4 when `jump=1` (see writeback note below).
 
 **Notes on writeback for JAL/JALR:** The value written to rd is PC+4 (the return address), NOT the ALU result. This requires an additional mux in the writeback path: `wb_data = jump ? pc_plus_4 : (mem_to_reg ? mem_data : alu_result)`.
 
@@ -259,10 +273,12 @@ WB (Write Back)
 
 **Data Hazards — WB→EX Forwarding Only:**
 ```
-forward_rs1 = (wb_reg_write && wb_rd != 0 && wb_rd == ex_rs1)
+forward_rs1 = (wb_reg_write && wb_rd != 0 && wb_rd == ex_rs1) && (alu_src_a == 2'b00)
 forward_rs2 = (wb_reg_write && wb_rd != 0 && wb_rd == ex_rs2)
 ```
 ⚠ The `wb_rd != 0` check is MANDATORY — writes to x0 must never be forwarded.
+⚠ The `alu_src_a == 2'b00` gate on `forward_rs1` is MANDATORY — when ALU-A is PC (AUIPC, JAL) or zero (LUI), forwarding must be suppressed or it will corrupt the result. `forward_rs2` has no equivalent gate since ALU-B is always rs2 or an immediate (never PC or zero).
+⚠ **Store forwarding:** For store instructions, `rs2` is the store *data* (not an ALU operand) and routes directly to the memory write port — it does not pass through the `alu_src` mux. `forward_rs2` must therefore be routed to both (a) the ALU-B forwarding mux and (b) the store data path. A store that immediately follows a WB-stage write to the same register requires store data forwarding; failing to forward produces a silent write of stale data.
 
 No load-use stall is needed because memory access occurs in EX — loaded data is available at WB and forwarded to the next EX.
 
@@ -327,9 +343,9 @@ No load-use stall is needed because memory access occurs in EX — loaded data i
 | `data_in` | Input | 32 | Read data from external data memory |
 | `data_out` | Output | 32 | Write data to external data memory |
 | `data_addr` | Output | 32 | Data memory address |
-| `data_we` | Output | 4 | Byte write enables |
+| `data_we` | Output | 4 | Byte write enables — **active-high, AXI/AMBA convention, one bit per byte lane** |
 | `data_re` | Output | 1 | Read enable |
-| `halt` | Output | 1 | Processor halted (ECALL/EBREAK/illegal) |
+| `halt` | Output | 1 | Processor halted — driven by `halt_o \|\| illegal_instr_o` from decoder (⚠ pending ar confirmation: one pin or two?) |
 
 **⚠ Pin budget problem:** ~100+ signals but only ~40-60 I/O pads available on 1mm×1mm die at 180nm. Bus multiplexing or serialization required. **This is an open design decision — discuss with senior lead ar.**
 
