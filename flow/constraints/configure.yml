@@ -1,0 +1,7 @@
+name: constraints
+
+outputs:
+  - constraints.tcl
+
+commands:
+  - cp constraints.tcl outputs/constraints.tcl
