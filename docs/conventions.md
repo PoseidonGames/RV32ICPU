@@ -21,7 +21,7 @@ Source: Prof. Torng's EE 599 Tutorial 3 (Fall 2025), adapted for TSI.
 7. `endmodule`
 
 ## Formatting
-- ≤74 chars per line, 2-space indent, never tabs
+- ≤74 chars per line, 2-space indent, never tabs (exception: fixed-width banner separator lines `// ====...====` may be 78 chars)
 - One port per line, vertically aligned
 - Named port bindings (`.port(signal)`), one per line
 

@@ -7,9 +7,8 @@
 //              no loads/stores, no forwarding. M0 scope per ar April 2026.
 // M0 known limitations (to be resolved in M1):
 //   - JAL/JALR: rd receives ALU result, NOT PC+4 (no PC available in M0).
-//   - AUIPC: result is imm (PC substituted with 0; wrong but expected).
-//   - jalr_target computed here (gotchas.md #6) but not wired to PC mux
-//     (no PC mux in M0); will be connected in M1.
+//   - AUIPC: result is 0+imm (pc_val=32'h0 placeholder; wrong but expected).
+//   - jalr_target_o is wired out (gotchas.md #6); connect to PC mux in M1.
 //   - halt_nc/illegal_instr_nc must be promoted to top-level ports in M1.
 // Author: Beaux Cable
 // Date: April 2026
@@ -21,11 +20,13 @@ module datapath_m0 (
   input  logic        rst_n,           // active-low async reset
 
   input  logic [31:0] instr_i,         // instruction word (from testbench)
+  input  logic [31:0] pc_i,            // current PC (M0: tie to 32'h0)
 
   // Testbench observability outputs
   output logic [31:0] alu_result_o,    // ALU result this cycle
   output logic        reg_write_o,     // register file write enable (control)
-  output logic [ 4:0] rd_addr_o        // destination register this cycle
+  output logic [ 4:0] rd_addr_o,       // dest reg (5'b0 when reg_write=0)
+  output logic [31:0] jalr_target_o    // JALR PC-next: (rs1+imm)&~1 (gotcha #6)
 );
 
   // --------------------------------------------------------------------------
@@ -89,23 +90,24 @@ module datapath_m0 (
   logic [31:0] alu_result;
 
   // JALR LSB-clear (gotchas.md #6). Ownership is here per spec.
-  // In M0 there is no PC mux, so jalr_target is declared and computed
-  // but not yet connected to any PC-next path. Wire it in for M1.
+  // Exposed as jalr_target_o so synthesis cannot prune it and M1 has a
+  // direct port to connect to the PC-next mux (selected when jalr_o=1).
   logic [31:0] jalr_target;
-  assign jalr_target = {alu_result[31:1], 1'b0};
+  assign jalr_target   = {alu_result[31:1], 1'b0};
+  assign jalr_target_o = jalr_target;
+
 
   // --------------------------------------------------------------------------
   // ALU operand A mux (canonical-reference.md §6 LUI/AUIPC note; §6.1)
   //   2'b00 → rs1_data  (R-type, I-type ALU, loads, stores, JALR)
-  //   2'b01 → 32'h0     (PC placeholder — no PC in M0; AUIPC/JAL produce
-  //                       wrong results in M0, acceptable per ar scope)
+  //   2'b01 → pc_i      (AUIPC/JAL: current PC; M0 tie to 32'h0)
   //   2'b10 → 32'h0     (zero — correct for LUI: 0 + U-imm = U-imm)
   // --------------------------------------------------------------------------
   always_comb begin
     alu_a = 32'h0; // default: prevents latch inference (gotchas.md #1)
     case (alu_src_a)
       2'b00:   alu_a = rs1_data;
-      2'b01:   alu_a = 32'h0;   // PC placeholder (no PC in M0)
+      2'b01:   alu_a = pc_i;     // AUIPC/JAL: current PC (M0: tied to 0)
       2'b10:   alu_a = 32'h0;   // zero (LUI: 0 + U-imm = U-imm)
       default: alu_a = 32'h0;
     endcase

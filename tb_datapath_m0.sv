@@ -56,6 +56,7 @@ module tb_datapath_m0;
   logic [31:0] alu_result_o;
   logic        reg_write_o;
   logic [ 4:0] rd_addr_o;
+  logic [31:0] jalr_target_o;
 
   // --------------------------------------------------------------------------
   // Clock generation: 50 MHz (period=20 ns)
@@ -67,12 +68,14 @@ module tb_datapath_m0;
   // DUT instantiation
   // --------------------------------------------------------------------------
   datapath_m0 dut (
-    .clk          (clk),
-    .rst_n        (rst_n),
-    .instr_i      (instr_i),
-    .alu_result_o (alu_result_o),
-    .reg_write_o  (reg_write_o),
-    .rd_addr_o    (rd_addr_o)
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .instr_i       (instr_i),
+    .pc_i          (32'h0),       // M0: no PC, tie to zero
+    .alu_result_o  (alu_result_o),
+    .reg_write_o   (reg_write_o),
+    .rd_addr_o     (rd_addr_o),
+    .jalr_target_o (jalr_target_o)
   );
 
   // --------------------------------------------------------------------------
