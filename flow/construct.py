@@ -172,6 +172,11 @@ def construct():
 
   g.update_params( parameters )
 
+  # Relax hold optimizer on postroute to reduce memory pressure.
+  # Default hold_target_slack=0.005 (5 ps) causes OOM on shared sessions.
+  # 0.020 = full clock period — just don't make things worse.
+  postroute.update_params({ 'hold_target_slack': 0.020 })
+
   return g
 
 
