@@ -4,4 +4,4 @@ outputs:
   - design.v
 
 commands:
-  - cat alu.sv regfile.sv imm_gen.sv control_decoder.sv alu_control.sv datapath_m0.sv > outputs/design.v
+  - cat alu.sv regfile.sv imm_gen.sv control_decoder.sv alu_control.sv branch_comparator.sv load_store_unit.sv forwarding_unit.sv pipeline_top.sv > outputs/design.v

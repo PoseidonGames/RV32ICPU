@@ -1,7 +1,7 @@
 #=========================================================================
-# constraints.tcl — datapath_m0, TSMC 180nm, 50 MHz target
+# constraints.tcl — pipeline_top (M1), TSMC 180nm, 50 MHz target
 #=========================================================================
-# Real clock on clk port (datapath_m0 has synchronous register file).
+# Real clock on clk port (pipeline_top has synchronous register file).
 # Input/output delay budgets set to 10% of period as a reasonable
 # starting point; tighten after seeing timing reports from DC.
 #=========================================================================

@@ -1,7 +1,7 @@
 #=========================================================================
 # construct.py
 #=========================================================================
-# M0 single-cycle datapath — TSI RV32I processor, TSMC 180nm tapeout
+# M1 3-stage pipeline — TSI RV32I processor, TSMC 180nm tapeout
 # Adapted from GcdUnit demo template (construct-commercial-full.py).
 #
 # Designer : Beaux Cable
@@ -31,7 +31,7 @@ def construct():
 
   parameters = {
     'construct_path' : __file__,
-    'design_name'    : 'datapath_m0',
+    'design_name'    : 'pipeline_top',
     'clock_period'   : 20.0,          # 50 MHz target
     'adk'            : adk_name,
     'adk_view'       : adk_view,
