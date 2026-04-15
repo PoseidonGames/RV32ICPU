@@ -23,15 +23,42 @@ module alu (
   localparam logic [3:0] ALU_SLT  = 4'b0101;
   localparam logic [3:0] ALU_SLTU = 4'b0110;
   localparam logic [3:0] ALU_SLL  = 4'b0111;
-  localparam logic [3:0] ALU_SRL  = 4'b1000;
-  localparam logic [3:0] ALU_SRA  = 4'b1001;
+  localparam logic [3:0] ALU_SRL      = 4'b1000;
+  localparam logic [3:0] ALU_SRA      = 4'b1001;
+  // M2a custom extensions (canonical-reference.md §8.1, §8.3)
+  localparam logic [3:0] ALU_POPCOUNT = 4'b1010; // population count
+  localparam logic [3:0] ALU_BREV     = 4'b1011; // bit reversal
+  localparam logic [3:0] ALU_CLZ      = 4'b1111; // count leading zeros
+  // M2b custom extension (canonical-reference.md §8.2)
+  localparam logic [3:0] ALU_MUL16S   = 4'b1110; // signed 16x16 multiply
 
   // Shift amount is always the lower 5 bits of operand B (gotchas.md #3)
   logic [4:0] shamt;
   assign shamt = b_i[4:0];
 
+  // Intermediate for POPCOUNT adder tree (range 0-32, needs 6 bits)
+  logic [5:0] popcount_sum;
+
+  // Intermediates for MUL16S signed 16x16 partial-product tree
+  // (canonical-reference.md §8.2). Declared at module level: always_comb
+  // case items cannot declare variables in many synthesis tools.
+  logic signed [15:0] mul_op_a;  // sign-extended rs1[15:0]
+  logic signed [15:0] mul_op_b;  // sign-extended rs2[15:0]
+  logic        [15:0] mul_abs_a; // absolute value of mul_op_a
+  logic        [15:0] mul_abs_b; // absolute value of mul_op_b
+  logic               mul_negate; // 1 = result must be negated (signs differ)
+  logic        [31:0] mul_sum;   // unsigned partial-product tree sum
+
   always_comb begin
-    result_o = 32'h0; // default: prevents latch inference
+    result_o     = 32'h0; // default: prevents latch inference
+    popcount_sum = 6'h0;  // default: prevents latch inference
+    // MUL16S defaults: prevents latch inference (gotchas.md #1)
+    mul_op_a   = 16'sh0;
+    mul_op_b   = 16'sh0;
+    mul_abs_a  = 16'h0;
+    mul_abs_b  = 16'h0;
+    mul_negate = 1'b0;
+    mul_sum    = 32'h0;
     case (alu_ctrl_i)
       ALU_ADD:  result_o = a_i + b_i;
       ALU_SUB:  result_o = a_i - b_i;
@@ -43,6 +70,137 @@ module alu (
       ALU_SLL:  result_o = a_i << shamt;
       ALU_SRL:  result_o = a_i >> shamt;
       ALU_SRA:  result_o = $unsigned($signed(a_i) >>> shamt);
+
+      // ------------------------------------------------------------------
+      // M2a: POPCOUNT — count 1-bits in a_i (rs1).
+      // Adder tree: sum all 32 individual bits. Result range 0–32 fits
+      // in 6 bits; zero-extended to 32. rs2/b_i is ignored (unary op).
+      // popcount_sum declared as 6-bit to give synthesis the right width.
+      // canonical-reference.md §8.1
+      // ------------------------------------------------------------------
+      ALU_POPCOUNT: begin
+        popcount_sum =
+          {5'h0, a_i[ 0]} + {5'h0, a_i[ 1]} +
+          {5'h0, a_i[ 2]} + {5'h0, a_i[ 3]} +
+          {5'h0, a_i[ 4]} + {5'h0, a_i[ 5]} +
+          {5'h0, a_i[ 6]} + {5'h0, a_i[ 7]} +
+          {5'h0, a_i[ 8]} + {5'h0, a_i[ 9]} +
+          {5'h0, a_i[10]} + {5'h0, a_i[11]} +
+          {5'h0, a_i[12]} + {5'h0, a_i[13]} +
+          {5'h0, a_i[14]} + {5'h0, a_i[15]} +
+          {5'h0, a_i[16]} + {5'h0, a_i[17]} +
+          {5'h0, a_i[18]} + {5'h0, a_i[19]} +
+          {5'h0, a_i[20]} + {5'h0, a_i[21]} +
+          {5'h0, a_i[22]} + {5'h0, a_i[23]} +
+          {5'h0, a_i[24]} + {5'h0, a_i[25]} +
+          {5'h0, a_i[26]} + {5'h0, a_i[27]} +
+          {5'h0, a_i[28]} + {5'h0, a_i[29]} +
+          {5'h0, a_i[30]} + {5'h0, a_i[31]};
+        result_o = {26'h0, popcount_sum};
+      end
+
+      // ------------------------------------------------------------------
+      // M2a: BREV — bit-reverse a_i (rs1).
+      // Pure wire swizzle; zero area. rs2/b_i is ignored (unary op).
+      // canonical-reference.md §8.1
+      // ------------------------------------------------------------------
+      ALU_BREV: result_o = {
+        a_i[ 0], a_i[ 1], a_i[ 2], a_i[ 3],
+        a_i[ 4], a_i[ 5], a_i[ 6], a_i[ 7],
+        a_i[ 8], a_i[ 9], a_i[10], a_i[11],
+        a_i[12], a_i[13], a_i[14], a_i[15],
+        a_i[16], a_i[17], a_i[18], a_i[19],
+        a_i[20], a_i[21], a_i[22], a_i[23],
+        a_i[24], a_i[25], a_i[26], a_i[27],
+        a_i[28], a_i[29], a_i[30], a_i[31]};
+
+      // ------------------------------------------------------------------
+      // M2b: MUL16S — signed 16x16→32 multiply.
+      // No * operator. Sign-magnitude approach:
+      //   1. Extract signed 16-bit operands from a_i[15:0] / b_i[15:0].
+      //   2. Compute absolute values via two's complement negation.
+      //   3. Sum 16 partial products (unsigned tree: AND + shift + add).
+      //   4. If signs differ, negate result via two's complement.
+      // Partial products: pp[i] = (mul_abs_a & {16{mul_abs_b[i]}}) << i,
+      // zero-extended to 32 bits before shifting.
+      // Uses +, <<, &, ~ only. No * operator. canonical-reference.md §8.2
+      // ------------------------------------------------------------------
+      ALU_MUL16S: begin
+        mul_op_a   = $signed(a_i[15:0]);
+        mul_op_b   = $signed(b_i[15:0]);
+        mul_abs_a  = mul_op_a[15]
+                       ? (~mul_op_a[15:0] + 16'd1) : mul_op_a[15:0];
+        mul_abs_b  = mul_op_b[15]
+                       ? (~mul_op_b[15:0] + 16'd1) : mul_op_b[15:0];
+        mul_negate = mul_op_a[15] ^ mul_op_b[15];
+        mul_sum =
+          ({16'h0, mul_abs_a} & {32{mul_abs_b[ 0]}})        +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 1]}}) <<  1) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 2]}}) <<  2) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 3]}}) <<  3) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 4]}}) <<  4) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 5]}}) <<  5) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 6]}}) <<  6) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 7]}}) <<  7) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 8]}}) <<  8) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[ 9]}}) <<  9) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[10]}}) << 10) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[11]}}) << 11) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[12]}}) << 12) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[13]}}) << 13) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[14]}}) << 14) +
+          (({16'h0, mul_abs_a} & {32{mul_abs_b[15]}}) << 15);
+        result_o = mul_negate ? (~mul_sum + 32'd1) : mul_sum;
+      end
+
+      // ------------------------------------------------------------------
+      // M2a: CLZ — count leading zeros in a_i (rs1).
+      // Priority encoder: scans from bit 31 down. Result range 0-32
+      // fits in 6 bits; zero-extended to 32. rs2/b_i is ignored (unary).
+      // casez with '?' wildcard (iverilog compatibility; synthesis equivalent).
+      // Priority is first-match top-to-bottom; synthesis optimizes to tree.
+      // All 33 patterns listed (positions 0-32) plus a redundant default.
+      // canonical-reference.md §8.1
+      // ------------------------------------------------------------------
+      ALU_CLZ: begin
+        casez (a_i)
+          32'b1???????????????????????????????: result_o = 32'd0;
+          32'b01??????????????????????????????: result_o = 32'd1;
+          32'b001?????????????????????????????: result_o = 32'd2;
+          32'b0001????????????????????????????: result_o = 32'd3;
+          32'b00001???????????????????????????: result_o = 32'd4;
+          32'b000001??????????????????????????: result_o = 32'd5;
+          32'b0000001?????????????????????????: result_o = 32'd6;
+          32'b00000001????????????????????????: result_o = 32'd7;
+          32'b000000001???????????????????????: result_o = 32'd8;
+          32'b0000000001??????????????????????: result_o = 32'd9;
+          32'b00000000001?????????????????????: result_o = 32'd10;
+          32'b000000000001????????????????????: result_o = 32'd11;
+          32'b0000000000001???????????????????: result_o = 32'd12;
+          32'b00000000000001??????????????????: result_o = 32'd13;
+          32'b000000000000001?????????????????: result_o = 32'd14;
+          32'b0000000000000001????????????????: result_o = 32'd15;
+          32'b00000000000000001???????????????: result_o = 32'd16;
+          32'b000000000000000001??????????????: result_o = 32'd17;
+          32'b0000000000000000001?????????????: result_o = 32'd18;
+          32'b00000000000000000001????????????: result_o = 32'd19;
+          32'b000000000000000000001???????????: result_o = 32'd20;
+          32'b0000000000000000000001??????????: result_o = 32'd21;
+          32'b00000000000000000000001?????????: result_o = 32'd22;
+          32'b000000000000000000000001????????: result_o = 32'd23;
+          32'b0000000000000000000000001???????: result_o = 32'd24;
+          32'b00000000000000000000000001??????: result_o = 32'd25;
+          32'b000000000000000000000000001?????: result_o = 32'd26;
+          32'b0000000000000000000000000001????: result_o = 32'd27;
+          32'b00000000000000000000000000001???: result_o = 32'd28;
+          32'b000000000000000000000000000001??: result_o = 32'd29;
+          32'b0000000000000000000000000000001?: result_o = 32'd30;
+          32'b00000000000000000000000000000001: result_o = 32'd31;
+          32'b00000000000000000000000000000000: result_o = 32'd32;
+          default: result_o = 32'd32;
+        endcase
+      end
+
       default:  result_o = 32'h0;
     endcase
   end
@@ -600,20 +758,20 @@ endmodule
 // Module: alu_control
 // Description: Decodes coarse ALU category (alu_op) plus instruction
 //              fields (funct3, funct7[5]) into the 4-bit alu_ctrl signal
-//              fed to alu.sv. Combinational only. alu_ctrl 4'b1111 is
-//              unallocated per §8.3 and asserts illegal_o=1 as a stub.
-//              Codes 4'b1010-4'b1110 are M2a/M2b reserved — not flagged.
+//              fed to alu.sv. Combinational only. All 4-bit alu_ctrl codes
+//              0000-1111 are allocated (§8.3); no unallocated code guard.
 // Author: Beaux Cable
 // Date: April 2026
 // Project: TSI RV32I Pipelined Processor (TSMC 180nm)
 // ============================================================================
 
 module alu_control (
-  input  logic [1:0] alu_op_i,    // coarse ALU category (§6.2)
-  input  logic [2:0] funct3_i,    // instruction[14:12]
-  input  logic       funct7b5_i,  // instruction[30]: ADD/SUB, SRL/SRA
-  output logic [3:0] alu_ctrl_o,  // operation select → alu.sv
-  output logic       illegal_o    // 1 = alu_ctrl 4'b1111 (unallocated per §8.3)
+  input  logic [1:0] alu_op_i,   // coarse ALU category (§6.2)
+  input  logic [2:0] funct3_i,   // instruction[14:12]
+  input  logic [6:0] funct7_i,   // instruction[31:25] (full funct7)
+  input  logic [6:0] opcode_i,   // instruction[6:0] (distinguish CUSTOM-0)
+  output logic [3:0] alu_ctrl_o, // operation select → alu.sv
+  output logic       illegal_o   // 1 = unrecognised funct7/funct3 under CUSTOM-0
 );
 
   // --------------------------------------------------------------------
@@ -627,9 +785,14 @@ module alu_control (
   localparam logic [3:0] ALU_SLT  = 4'b0101;
   localparam logic [3:0] ALU_SLTU = 4'b0110;
   localparam logic [3:0] ALU_SLL  = 4'b0111;
-  localparam logic [3:0] ALU_SRL        = 4'b1000;
-  localparam logic [3:0] ALU_SRA        = 4'b1001;
-  localparam logic [3:0] ALU_UNALLOCATED = 4'b1111; // §8.3: not reserved
+  localparam logic [3:0] ALU_SRL         = 4'b1000;
+  localparam logic [3:0] ALU_SRA         = 4'b1001;
+  // M2a custom extensions (canonical-reference.md §8.1, §8.3)
+  localparam logic [3:0] ALU_POPCOUNT = 4'b1010;
+  localparam logic [3:0] ALU_BREV     = 4'b1011;
+  localparam logic [3:0] ALU_CLZ      = 4'b1111; // count leading zeros
+  // M2b custom extension (canonical-reference.md §8.2)
+  localparam logic [3:0] ALU_MUL16S   = 4'b1110; // signed 16x16 multiply
 
   // alu_op encoding (canonical-reference.md §6.2)
   localparam logic [1:0] ALUOP_ADD    = 2'b00;
@@ -647,24 +810,39 @@ module alu_control (
   localparam logic [2:0] F3_OR      = 3'b110;
   localparam logic [2:0] F3_AND     = 3'b111;
 
+  // Opcode for CUSTOM-0 R-type (canonical-reference.md §2, §8.1)
+  localparam logic [6:0] OP_CUSTOM0 = 7'b0001011;
+
+  // funct7 values for M2a custom instructions (§8.1)
+  localparam logic [6:0] F7_POPCOUNT = 7'b0000000;
+  localparam logic [6:0] F7_BREV     = 7'b0000001;
+  localparam logic [6:0] F7_MUL16S   = 7'b0000100; // reserved for M2b
+  localparam logic [6:0] F7_CLZ      = 7'b0000101; // count leading zeros
+
   // --------------------------------------------------------------------
   // Internal signals
   // --------------------------------------------------------------------
   logic [3:0] rtype_ctrl;
   logic [3:0] itype_ctrl;
 
+  // Derive funct7b5 from full funct7 for existing R/I-type decode.
+  // Keeping this internal avoids any change to rtype_ctrl/itype_ctrl logic.
+  logic funct7b5;
+  assign funct7b5 = funct7_i[5];
+
   // --------------------------------------------------------------------
   // R-type decode: funct3 + funct7b5 (canonical-reference.md §1.1)
+  // Uses internal funct7b5 derived from funct7_i[5].
   // --------------------------------------------------------------------
   always_comb begin
     rtype_ctrl = ALU_ADD;  // default prevents latch (gotchas.md #1)
     case (funct3_i)
-      F3_ADD_SUB: rtype_ctrl = funct7b5_i ? ALU_SUB : ALU_ADD;
+      F3_ADD_SUB: rtype_ctrl = funct7b5 ? ALU_SUB : ALU_ADD;
       F3_SLL:     rtype_ctrl = ALU_SLL;
       F3_SLT:     rtype_ctrl = ALU_SLT;
       F3_SLTU:    rtype_ctrl = ALU_SLTU;
       F3_XOR:     rtype_ctrl = ALU_XOR;
-      F3_SRL_SRA: rtype_ctrl = funct7b5_i ? ALU_SRA : ALU_SRL;
+      F3_SRL_SRA: rtype_ctrl = funct7b5 ? ALU_SRA : ALU_SRL;
       F3_OR:      rtype_ctrl = ALU_OR;
       F3_AND:     rtype_ctrl = ALU_AND;
       default:    rtype_ctrl = ALU_ADD;
@@ -675,6 +853,7 @@ module alu_control (
   // I-type decode: funct3 only; shifts also use funct7b5.
   // funct7b5 is NOT checked for non-shift I-type: ADDI has no SUBI
   // (canonical-reference.md §1.2; gotchas.md #10)
+  // Uses internal funct7b5 derived from funct7_i[5].
   // --------------------------------------------------------------------
   always_comb begin
     itype_ctrl = ALU_ADD;  // default prevents latch (gotchas.md #1)
@@ -685,7 +864,7 @@ module alu_control (
       F3_SLTU:    itype_ctrl = ALU_SLTU;   // SLTIU
       F3_XOR:     itype_ctrl = ALU_XOR;    // XORI
       F3_SRL_SRA: itype_ctrl =             // SRLI / SRAI
-                    funct7b5_i ? ALU_SRA : ALU_SRL;
+                    funct7b5 ? ALU_SRA : ALU_SRL;
       F3_OR:      itype_ctrl = ALU_OR;     // ORI
       F3_AND:     itype_ctrl = ALU_AND;    // ANDI
       default:    itype_ctrl = ALU_ADD;
@@ -716,9 +895,38 @@ module alu_control (
       end
 
       ALUOP_RTYPE: begin
-        // R-type: funct3 + funct7b5 (§1.1)
-        alu_ctrl_o = rtype_ctrl;
-        illegal_o  = 1'b0;
+        // R-type path. Check opcode first: CUSTOM-0 has its own decode.
+        // Regular R-type and CUSTOM-0 both arrive here with alu_op=10.
+        if (opcode_i == OP_CUSTOM0) begin
+          // ----------------------------------------------------------
+          // CUSTOM-0 R-type: decode funct7 + funct3 for M2a extensions
+          // (canonical-reference.md §8.1)
+          // All confirmed M2a instructions use funct3=000.
+          // Any unrecognised funct7/funct3 combo sets illegal_o=1.
+          // ----------------------------------------------------------
+          alu_ctrl_o = ALU_ADD; // safe default; overwritten below
+          illegal_o  = 1'b0;
+          if (funct3_i == F3_ADD_SUB) begin
+            case (funct7_i)
+              F7_POPCOUNT: alu_ctrl_o = ALU_POPCOUNT; // POPCOUNT rs1
+              F7_BREV:     alu_ctrl_o = ALU_BREV;     // BREV rs1
+              F7_MUL16S:   alu_ctrl_o = ALU_MUL16S;   // MUL16S rs1,rs2
+              F7_CLZ:      alu_ctrl_o = ALU_CLZ;      // CLZ rs1
+              default: begin
+                alu_ctrl_o = ALU_ADD;
+                illegal_o  = 1'b1;
+              end
+            endcase
+          end else begin
+            // Unsupported funct3 under CUSTOM-0
+            alu_ctrl_o = ALU_ADD;
+            illegal_o  = 1'b1;
+          end
+        end else begin
+          // Regular RV32I R-type: funct3 + funct7b5 (§1.1)
+          alu_ctrl_o = rtype_ctrl;
+          illegal_o  = 1'b0;
+        end
       end
 
       ALUOP_ITYPE: begin
@@ -733,16 +941,9 @@ module alu_control (
       end
     endcase
 
-    // Stub for 4'b1111 only — the single truly unallocated code (§8.3).
-    // Codes 4'b1010-4'b1110 are reserved for M2a/M2b (POPCOUNT, BREV,
-    // BEXT, BDEP, MAC) and must NOT be flagged illegal here.
-    // Base RV32I funct3/funct7 cannot produce any code >= 4'b1010,
-    // so this guard is dead for M0/M1 — it activates only if future
-    // M2a/M2b wiring mis-routes an unallocated code.
-    if (alu_ctrl_o == ALU_UNALLOCATED) begin
-      alu_ctrl_o = ALU_ADD;
-      illegal_o  = 1'b1;
-    end
+    // NOTE: 4-bit alu_ctrl space is fully allocated (§8.3).
+    // All codes 4'b0000-4'b1111 map to valid operations.
+    // No unallocated code guard needed.
   end
 
 endmodule
@@ -1019,6 +1220,555 @@ module forwarding_unit (
 
 endmodule
 // ============================================================================
+// Module: compressed_decoder
+// Description: Pre-decode expansion of RV32C 16-bit compressed instructions
+//              to 32-bit RV32I equivalents (M2c milestone).
+//              Pure combinational — no state.
+//              Illegal encodings produce instr_o=32'h0, illegal_o=1.
+//              The 32'h0 output (opcode 7'h00) is caught by control_decoder
+//              as illegal_instr_o=1, driving halt_o through existing path.
+// Author: Beaux Cable
+// Date: April 2026
+// Project: TSI RV32I Pipelined Processor (TSMC 180nm)
+// ============================================================================
+
+module compressed_decoder (
+  input  logic [15:0] instr_i,
+  output logic [31:0] instr_o,
+  output logic        illegal_o
+);
+
+  // --------------------------------------------------------------------------
+  // Opcode constants (canonical-reference.md §2)
+  // --------------------------------------------------------------------------
+  localparam logic [6:0] OP_R    = 7'b0110011; // R-type ALU
+  localparam logic [6:0] OP_I    = 7'b0010011; // I-type ALU
+  localparam logic [6:0] OP_LOAD = 7'b0000011; // Loads
+  localparam logic [6:0] OP_STOR = 7'b0100011; // Stores
+  localparam logic [6:0] OP_BR   = 7'b1100011; // Branches
+  localparam logic [6:0] OP_JAL  = 7'b1101111; // JAL
+  localparam logic [6:0] OP_JALR = 7'b1100111; // JALR
+  localparam logic [6:0] OP_LUI  = 7'b0110111; // LUI
+  localparam logic [6:0] OP_SYS  = 7'b1110011; // SYSTEM (EBREAK)
+
+  // NOP = ADDI x0, x0, 0  (canonical-reference.md §7.3)
+  localparam logic [31:0] NOP_32 = 32'h00000013;
+
+  // --------------------------------------------------------------------------
+  // Expansion logic
+  // --------------------------------------------------------------------------
+
+  // Compact register fields expanded to x8-x15
+  // (canonical-reference.md §12.2): {2'b01, 3-bit}
+  logic [4:0] rd_c;   // instr_i[4:2]  -> x8-x15
+  logic [4:0] rs1_c;  // instr_i[9:7]  -> x8-x15
+  logic [4:0] rs2_c;  // instr_i[4:2]  -> x8-x15
+
+  assign rd_c  = {2'b01, instr_i[4:2]};
+  assign rs1_c = {2'b01, instr_i[9:7]};
+  assign rs2_c = {2'b01, instr_i[4:2]};
+
+  // Full-width register fields (used by C2 and some C1 instructions)
+  logic [4:0] rd_full;   // instr_i[11:7]
+  logic [4:0] rs2_full;  // instr_i[6:2]
+
+  assign rd_full  = instr_i[11:7];
+  assign rs2_full = instr_i[6:2];
+
+  // --------------------------------------------------------------------------
+  // Immediate construction helpers — all declared as signals so always_comb
+  // can reference them without declaring inside a procedural block.
+  // --------------------------------------------------------------------------
+
+  // C.ADDI4SPN: nzuimm[9:0] = {inst[10:7],inst[12:11],inst[5],inst[6],2'b00}
+  // zero-extended to 12 bits for I-type ADDI rd', x2, nzuimm
+  logic [11:0] imm_addi4spn;
+  assign imm_addi4spn = {2'b00,
+                          instr_i[10:7],
+                          instr_i[12:11],
+                          instr_i[5],
+                          instr_i[6],
+                          2'b00};
+
+  // C.LW / C.SW: uimm[6:0] = {inst[5],inst[12:10],inst[6],2'b00}
+  // zero-extended to 12 bits for I-type (LW) or split for S-type (SW)
+  logic [6:0] uimm_lw;
+  assign uimm_lw = {instr_i[5], instr_i[12:10], instr_i[6], 2'b00};
+
+  // C.ADDI / C.LI / C.ANDI: sext({inst[12], inst[6:2]}) to 12 bits
+  logic [11:0] imm_addi;
+  assign imm_addi = {{6{instr_i[12]}}, instr_i[12], instr_i[6:2]};
+
+  // C.JAL / C.J: sext 12-bit offset to 21-bit J-type immediate.
+  // Raw 12-bit: bit[11]=inst[12](sign), bit[10]=inst[8], bits[9:8]=inst[10:9],
+  //             bit[7]=inst[6], bit[6]=inst[7], bit[5]=inst[2],
+  //             bit[4]=inst[11], bits[3:1]=inst[5:3], bit[0]=1'b0.
+  // Sign-extended: bits[20:12] = {9{inst[12]}}, bit[11] = inst[12] itself.
+  // Total 21 bits: 9+1+1+2+1+1+1+1+3+1 = 21. (canonical-ref §12.4)
+  logic [20:0] imm_jal_21;
+  assign imm_jal_21 = {{9{instr_i[12]}},
+                        instr_i[12],    // bit[11]: sign bit of raw 12-bit
+                        instr_i[8],     // bit[10]
+                        instr_i[10:9],  // bits[9:8]
+                        instr_i[6],     // bit[7]
+                        instr_i[7],     // bit[6]
+                        instr_i[2],     // bit[5]
+                        instr_i[11],    // bit[4]
+                        instr_i[5:3],   // bits[3:1]
+                        1'b0};          // bit[0]: LSB always 0 (×2)
+
+  // C.LUI: nzimm placed in U-type upper 20 bits
+  // nzimm[17:12] = {inst[12], inst[6:2]}, lower 12 bits zero
+  // For U-type instr_o[31:12] = sign-extended nzimm[17:12] expanded to 20b
+  logic [19:0] imm_lui_20;
+  assign imm_lui_20 = {{14{instr_i[12]}}, instr_i[12], instr_i[6:2]};
+
+  // C.ADDI16SP: sext({inst[12],inst[4:3],inst[5],inst[2],inst[6],4'b0}) 12-bit
+  logic [11:0] imm_addi16sp;
+  assign imm_addi16sp = {{2{instr_i[12]}},
+                          instr_i[12],
+                          instr_i[4:3],
+                          instr_i[5],
+                          instr_i[2],
+                          instr_i[6],
+                          4'b0000};
+
+  // C.BEQZ / C.BNEZ: sext 9-bit offset to 13-bit B-type immediate.
+  // Raw 9-bit: bit[8]=inst[12](sign), bits[7:6]=inst[6:5], bit[5]=inst[2],
+  //            bits[4:3]=inst[11:10], bits[2:1]=inst[4:3], bit[0]=1'b0.
+  // 13-bit: bits[12:9]={4{inst[12]}}, bit[8]=inst[12] itself, then rest.
+  // Total: 4+1+2+1+2+2+1 = 13. (canonical-ref §12.4)
+  logic [12:0] imm_br_13;
+  assign imm_br_13 = {{4{instr_i[12]}},
+                       instr_i[12],     // bit[8]: sign bit of raw 9-bit
+                       instr_i[6:5],    // bits[7:6]
+                       instr_i[2],      // bit[5]
+                       instr_i[11:10],  // bits[4:3]
+                       instr_i[4:3],    // bits[2:1]
+                       1'b0};           // bit[0]: LSB always 0 (×2)
+
+  // C.LWSP: uimm[7:0] = {inst[3:2], inst[12], inst[6:4], 2'b00}
+  // zero-extended to 12 bits for I-type LW rd, uimm(x2)
+  logic [11:0] imm_lwsp;
+  assign imm_lwsp = {4'b0000,
+                     instr_i[3:2], instr_i[12], instr_i[6:4],
+                     2'b00};
+
+  // C.SWSP: uimm[7:0] = {inst[8:7], inst[12:9], 2'b00}
+  // placed as S-type immediate split: imm[11:5] and imm[4:0]
+  logic [7:0] uimm_swsp;
+  assign uimm_swsp = {instr_i[8:7], instr_i[12:9], 2'b00};
+
+  // Shift amount: {inst[12], inst[6:2]} — used by SRLI, SRAI, SLLI
+  logic [5:0] shamt;
+  assign shamt = {instr_i[12], instr_i[6:2]};
+
+  // --------------------------------------------------------------------------
+  // Primary dispatch: {funct3[2:0], quadrant[1:0]} = {inst[15:13], inst[1:0]}
+  // --------------------------------------------------------------------------
+
+  always_comb begin
+    // Defaults — prevent latch inference (gotcha #1)
+    instr_o  = NOP_32;
+    illegal_o = 1'b0;
+
+    // All-zeros is always illegal (canonical-reference.md §12.1)
+    if (instr_i == 16'h0000) begin
+      instr_o  = 32'h00000000;
+      illegal_o = 1'b1;
+    end else begin
+      case ({instr_i[15:13], instr_i[1:0]})
+
+        // ====================================================================
+        // C0: Quadrant 0 (inst[1:0] = 00)
+        // ====================================================================
+
+        // C.ADDI4SPN -> ADDI rd', x2, nzuimm
+        5'b000_00: begin
+          if (imm_addi4spn == 12'h000) begin
+            // nzuimm = 0 is illegal (§12.7 rule 4)
+            instr_o  = 32'h00000000;
+            illegal_o = 1'b1;
+          end else begin
+            // I-type: {imm[11:0], rs1[4:0], funct3[2:0], rd[4:0], opcode}
+            instr_o = {imm_addi4spn, 5'd2, 3'b000, rd_c, OP_I};
+          end
+        end
+
+        // C0 funct3=001: F-extension C.FLD — illegal (§12.7 rule 2)
+        5'b001_00: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C.LW -> LW rd', uimm(rs1')
+        5'b010_00: begin
+          // I-type: {imm[11:0], rs1[4:0], funct3, rd[4:0], opcode}
+          // funct3=010 for LW; uimm zero-extended to 12 bits
+          instr_o = {{5'b00000, uimm_lw}, rs1_c, 3'b010, rd_c, OP_LOAD};
+        end
+
+        // C0 funct3=011: F-extension C.FLW — illegal (§12.7 rule 2)
+        5'b011_00: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C0 funct3=100: reserved — illegal (§12.7 rule 2)
+        5'b100_00: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C0 funct3=101: F-extension C.FSD — illegal (§12.7 rule 2)
+        5'b101_00: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C.SW -> SW rs2', uimm(rs1')
+        5'b110_00: begin
+          // S-type: {imm[11:5], rs2, rs1, funct3, imm[4:0], opcode}
+          // funct3=010 for SW
+          instr_o = {5'b00000, uimm_lw[6:5],
+                     rs2_c, rs1_c,
+                     3'b010,
+                     uimm_lw[4:0], OP_STOR};
+        end
+
+        // C0 funct3=111: F-extension C.FSW — illegal (§12.7 rule 2)
+        5'b111_00: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // ====================================================================
+        // C1: Quadrant 1 (inst[1:0] = 01)
+        // ====================================================================
+
+        // C.NOP / C.ADDI -> ADDI rd, rd, sext(nzimm)
+        // rd=x0 with imm=0 => C.NOP (expand to NOP_32)
+        // rd=x0 with imm!=0 => HINT (treat as NOP_32)
+        // rd!=x0 with imm=0 => HINT (still a valid ADDI, pass through)
+        5'b000_01: begin
+          // I-type: {imm[11:0], rs1[4:0], 3'b000, rd[4:0], OP_I}
+          // rd_full = inst[11:7], imm_addi is sext 12-bit
+          instr_o = {imm_addi, rd_full, 3'b000, rd_full, OP_I};
+        end
+
+        // C.JAL -> JAL x1, sext(imm)
+        // J-type: {imm[20],imm[10:1],imm[11],imm[19:12],rd[4:0],opcode}
+        5'b001_01: begin
+          instr_o = {imm_jal_21[20],
+                     imm_jal_21[10:1],
+                     imm_jal_21[11],
+                     imm_jal_21[19:12],
+                     5'd1,          // rd = x1 (link register)
+                     OP_JAL};
+        end
+
+        // C.LI -> ADDI rd, x0, sext(imm)
+        5'b010_01: begin
+          // I-type with rs1=x0
+          instr_o = {imm_addi, 5'd0, 3'b000, rd_full, OP_I};
+        end
+
+        // C.LUI / C.ADDI16SP (rd=x2 selects ADDI16SP)
+        5'b011_01: begin
+          if (rd_full == 5'd2) begin
+            // C.ADDI16SP -> ADDI x2, x2, sext(nzimm)
+            if (imm_addi16sp == 12'h000) begin
+              // nzimm=0 is illegal (§12.7 rule 5)
+              instr_o  = 32'h00000000;
+              illegal_o = 1'b1;
+            end else begin
+              instr_o = {imm_addi16sp, 5'd2, 3'b000, 5'd2, OP_I};
+            end
+          end else if (rd_full == 5'd0) begin
+            // rd=x0 is reserved/HINT — treat as NOP
+            instr_o = NOP_32;
+          end else begin
+            // C.LUI -> LUI rd, nzimm[17:12]
+            // U-type: {imm[31:12], rd[4:0], opcode}
+            // nzimm=0 is illegal (§12.7 rule 6)
+            if (imm_lui_20 == 20'h00000) begin
+              instr_o  = 32'h00000000;
+              illegal_o = 1'b1;
+            end else begin
+              instr_o = {imm_lui_20, rd_full, OP_LUI};
+            end
+          end
+        end
+
+        // C1 funct3=100: SRLI / SRAI / ANDI / SUB / XOR / OR / AND
+        5'b100_01: begin
+          case (instr_i[11:10])
+            // C.SRLI -> SRLI rd', rd', shamt
+            2'b00: begin
+              // shamt[5]=inst[12]; must be 0 on RV32 (§12.7 rule 9 for SLLI,
+              // same constraint applies to SRLI/SRAI per spec)
+              // treat shamt[5]=1 as illegal on RV32
+              if (shamt[5]) begin
+                instr_o  = 32'h00000000;
+                illegal_o = 1'b1;
+              end else begin
+                // I-type shift: funct7=0000000, funct3=101, OP_I
+                // {7'b0000000, shamt[4:0], rs1, 3'b101, rd, OP_I}
+                instr_o = {7'b0000000,
+                            shamt[4:0],
+                            rs1_c,
+                            3'b101,
+                            rs1_c,   // rd = rs1 (same register)
+                            OP_I};
+              end
+            end
+
+            // C.SRAI -> SRAI rd', rd', shamt
+            2'b01: begin
+              if (shamt[5]) begin
+                instr_o  = 32'h00000000;
+                illegal_o = 1'b1;
+              end else begin
+                // I-type shift: funct7=0100000, funct3=101, OP_I
+                instr_o = {7'b0100000,
+                            shamt[4:0],
+                            rs1_c,
+                            3'b101,
+                            rs1_c,
+                            OP_I};
+              end
+            end
+
+            // C.ANDI -> ANDI rd', rd', sext(imm)
+            2'b10: begin
+              // I-type: {imm[11:0], rs1, 3'b111, rd, OP_I}
+              instr_o = {imm_addi, rs1_c, 3'b111, rs1_c, OP_I};
+            end
+
+            // Sub-sub-decode: C.SUB / C.XOR / C.OR / C.AND
+            2'b11: begin
+              if (instr_i[12]) begin
+                // inst[12]=1 with inst[11:10]=11 is reserved on RV32
+                // (would be RV64 C.SUBW/C.ADDW; §12.7 rule 10)
+                instr_o  = 32'h00000000;
+                illegal_o = 1'b1;
+              end else begin
+                case (instr_i[6:5])
+                  // C.SUB -> SUB rd', rd', rs2'
+                  2'b00: begin
+                    // R-type: {7'b0100000, rs2, rs1, 3'b000, rd, OP_R}
+                    instr_o = {7'b0100000,
+                                rs2_c, rs1_c,
+                                3'b000, rs1_c,
+                                OP_R};
+                  end
+                  // C.XOR -> XOR rd', rd', rs2'
+                  2'b01: begin
+                    instr_o = {7'b0000000,
+                                rs2_c, rs1_c,
+                                3'b100, rs1_c,
+                                OP_R};
+                  end
+                  // C.OR -> OR rd', rd', rs2'
+                  2'b10: begin
+                    instr_o = {7'b0000000,
+                                rs2_c, rs1_c,
+                                3'b110, rs1_c,
+                                OP_R};
+                  end
+                  // C.AND -> AND rd', rd', rs2'
+                  2'b11: begin
+                    instr_o = {7'b0000000,
+                                rs2_c, rs1_c,
+                                3'b111, rs1_c,
+                                OP_R};
+                  end
+                  default: begin
+                    instr_o  = 32'h00000000;
+                    illegal_o = 1'b1;
+                  end
+                endcase
+              end
+            end
+
+            default: begin
+              instr_o  = 32'h00000000;
+              illegal_o = 1'b1;
+            end
+          endcase
+        end
+
+        // C.J -> JAL x0, sext(imm)  (same encoding as C.JAL but rd=x0)
+        5'b101_01: begin
+          instr_o = {imm_jal_21[20],
+                     imm_jal_21[10:1],
+                     imm_jal_21[11],
+                     imm_jal_21[19:12],
+                     5'd0,          // rd = x0 (discard link)
+                     OP_JAL};
+        end
+
+        // C.BEQZ -> BEQ rs1', x0, sext(off)
+        5'b110_01: begin
+          // B-type: {imm[12],imm[10:5],rs2,rs1,funct3,imm[4:1],imm[11],opcode}
+          // funct3=000 for BEQ; rs2=x0
+          instr_o = {imm_br_13[12],
+                     imm_br_13[10:5],
+                     5'd0,          // rs2 = x0
+                     rs1_c,
+                     3'b000,        // BEQ
+                     imm_br_13[4:1],
+                     imm_br_13[11],
+                     OP_BR};
+        end
+
+        // C.BNEZ -> BNE rs1', x0, sext(off)
+        5'b111_01: begin
+          // Same as BEQZ but funct3=001 for BNE
+          instr_o = {imm_br_13[12],
+                     imm_br_13[10:5],
+                     5'd0,          // rs2 = x0
+                     rs1_c,
+                     3'b001,        // BNE
+                     imm_br_13[4:1],
+                     imm_br_13[11],
+                     OP_BR};
+        end
+
+        // ====================================================================
+        // C2: Quadrant 2 (inst[1:0] = 10)
+        // ====================================================================
+
+        // C.SLLI -> SLLI rd, rd, shamt
+        5'b000_10: begin
+          // shamt[5]=inst[12]=1 is reserved on RV32 (§12.7 rule 9)
+          if (shamt[5]) begin
+            instr_o  = 32'h00000000;
+            illegal_o = 1'b1;
+          end else begin
+            // I-type shift: {7'b0000000, shamt[4:0], rs1, 3'b001, rd, OP_I}
+            instr_o = {7'b0000000,
+                        shamt[4:0],
+                        rd_full,    // rs1 = rd (same register)
+                        3'b001,
+                        rd_full,
+                        OP_I};
+          end
+        end
+
+        // C2 funct3=001: F-extension C.FLDSP — illegal (§12.7 rule 3)
+        5'b001_10: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C.LWSP -> LW rd, uimm(x2)
+        5'b010_10: begin
+          // rd=x0 is reserved (§12.7 rule 7)
+          if (rd_full == 5'd0) begin
+            instr_o  = 32'h00000000;
+            illegal_o = 1'b1;
+          end else begin
+            // I-type: {imm[11:0], rs1=x2, 3'b010, rd, OP_LOAD}
+            instr_o = {imm_lwsp, 5'd2, 3'b010, rd_full, OP_LOAD};
+          end
+        end
+
+        // C2 funct3=011: F-extension C.FLWSP — illegal (§12.7 rule 3)
+        5'b011_10: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C2 funct3=100: JR / MV / EBREAK / JALR / ADD
+        5'b100_10: begin
+          if (!instr_i[12]) begin
+            // inst[12] = 0
+            if (instr_i[6:2] == 5'b00000) begin
+              // rs2 = 0
+              if (rd_full == 5'd0) begin
+                // rs1=x0 is reserved (§12.7 rule 8)
+                instr_o  = 32'h00000000;
+                illegal_o = 1'b1;
+              end else begin
+                // C.JR -> JALR x0, 0(rs1)
+                // I-type: {12'h000, rs1, 3'b000, rd=x0, OP_JALR}
+                instr_o = {12'h000, rd_full, 3'b000, 5'd0, OP_JALR};
+              end
+            end else begin
+              // rs2 != 0: C.MV -> ADD rd, x0, rs2
+              // R-type: {7'b0000000, rs2, rs1=x0, 3'b000, rd, OP_R}
+              instr_o = {7'b0000000,
+                          rs2_full,
+                          5'd0,      // rs1 = x0
+                          3'b000,
+                          rd_full,
+                          OP_R};
+            end
+          end else begin
+            // inst[12] = 1
+            if (instr_i[6:2] == 5'b00000) begin
+              // rs2 = 0
+              if (rd_full == 5'd0) begin
+                // C.EBREAK -> EBREAK = 32'h00100073
+                instr_o = 32'h00100073;
+              end else begin
+                // C.JALR -> JALR x1, 0(rs1)
+                instr_o = {12'h000, rd_full, 3'b000, 5'd1, OP_JALR};
+              end
+            end else begin
+              // rs2 != 0: C.ADD -> ADD rd, rd, rs2
+              // R-type: {7'b0000000, rs2, rs1=rd, 3'b000, rd, OP_R}
+              instr_o = {7'b0000000,
+                          rs2_full,
+                          rd_full,   // rs1 = rd
+                          3'b000,
+                          rd_full,
+                          OP_R};
+            end
+          end
+        end
+
+        // C2 funct3=101: F-extension C.FSDSP — illegal (§12.7 rule 3)
+        5'b101_10: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // C.SWSP -> SW rs2, uimm(x2)
+        5'b110_10: begin
+          // S-type: {imm[11:5], rs2, rs1=x2, funct3=010, imm[4:0], OP_STOR}
+          // uimm_swsp[7:0]; imm[11:5] = {0,0,0,0, uimm[7:6], uimm[5]}
+          //               = {4'b0, uimm_swsp[7:6], uimm_swsp[5]}
+          // imm[4:0] = uimm_swsp[4:0] = {uimm_swsp[4:2], 2'b00}
+          // uimm_swsp = {inst[8:7], inst[12:9], 2'b00} — bits[7:0]
+          instr_o = {4'b0000,
+                     uimm_swsp[7:5],    // imm[11:5] upper part (zero-ext)
+                     rs2_full,
+                     5'd2,             // rs1 = x2 (sp)
+                     3'b010,           // SW
+                     uimm_swsp[4:0],   // imm[4:0]
+                     OP_STOR};
+        end
+
+        // C2 funct3=111: F-extension C.FSWSP — illegal (§12.7 rule 3)
+        5'b111_10: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+        // Catch-all: unknown encoding
+        default: begin
+          instr_o  = 32'h00000000;
+          illegal_o = 1'b1;
+        end
+
+      endcase
+    end
+  end
+
+endmodule
+// ============================================================================
 // Module: pipeline_top
 // Description: RV32I 3-stage pipeline integration top-level (M1 milestone).
 //              Stages: IF (fetch) -> EX (decode+execute+mem) -> WB (writeback).
@@ -1072,6 +1822,18 @@ module pipeline_top (
   logic [31:0] pc_plus_4;    // pc_reg + 4
   logic [31:0] pc_next;      // next-cycle PC value (resolved in EX)
 
+  // RV32C alignment buffer signals (M2c)
+  logic [15:0] upper_buf;        // saved upper halfword of prior fetch
+  logic        upper_valid;      // upper_buf holds a valid halfword
+  logic        is_compressed;    // current instruction is 16-bit
+  logic [31:0] pc_plus_2;        // pc_reg + 2 (compressed increment)
+  logic [31:0] pc_increment;     // 2 or 4 depending on is_compressed
+  logic [15:0] selected_hw;      // halfword being decoded this cycle
+  logic [31:0] raw_instr;        // assembled 32-bit word (pre-expansion)
+  logic [31:0] expanded_instr_c; // compressed_decoder output
+  logic [31:0] expanded_instr;   // final instruction to pipeline
+  logic        c_illegal;        // illegal signal from compressed_decoder
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
       pc_reg <= 32'h0;
@@ -1079,38 +1841,108 @@ module pipeline_top (
       pc_reg <= pc_next;
   end
 
-  assign pc_plus_4    = pc_reg + 32'd4;
-  assign instr_addr_o = pc_reg;
+  assign pc_plus_4 = pc_reg + 32'd4;
+  assign pc_plus_2 = pc_reg + 32'd2;
+
+  // Word-aligned fetch; when buffer holds upper half, fetch the next word
+  assign instr_addr_o = upper_valid
+    ? {pc_reg[31:2] + 30'd1, 2'b00}
+    : {pc_reg[31:2], 2'b00};
+
+  // Halfword selection and compression detection
+  assign selected_hw   = upper_valid ? upper_buf : instr_data_i[15:0];
+  assign is_compressed = (selected_hw[1:0] != 2'b11);
+
+  // Full instruction assembly (3 cases)
+  always_comb begin
+    // Default prevents latch inference (gotcha #1)
+    raw_instr = instr_data_i;
+    if (is_compressed)
+      raw_instr = {16'h0000, selected_hw}; // decoder sees [15:0]
+    else if (upper_valid)
+      raw_instr = {instr_data_i[15:0], upper_buf};  // straddling 32-bit
+    else
+      raw_instr = instr_data_i;              // word-aligned 32-bit
+  end
+
+  // Compressed decoder instantiation
+  compressed_decoder c_dec (
+    .instr_i  (selected_hw),
+    .instr_o  (expanded_instr_c),
+    .illegal_o(c_illegal)
+  );
+
+  // Final instruction: expanded if compressed, raw otherwise
+  assign expanded_instr = is_compressed ? expanded_instr_c : raw_instr;
+
+  // PC increment: 2 for compressed, 4 for 32-bit
+  assign pc_increment = is_compressed ? pc_plus_2 : pc_plus_4;
 
   // ==========================================================================
   // IF/EX pipeline register
   // Flush inserts NOP bubble on taken branch or any jump (gotcha #9).
+  // if_ex_pc_plus_n holds PC+2 or PC+4 depending on instruction width (M2c).
   // ==========================================================================
 
-  logic [31:0] if_ex_instr;     // latched instruction word
-  logic [31:0] if_ex_pc;        // latched PC of this instruction
-  logic [31:0] if_ex_pc_plus_4; // latched PC+4
-  logic        if_ex_valid;     // 0 = bubble/NOP
+  logic [31:0] if_ex_instr;       // latched instruction word
+  logic [31:0] if_ex_pc;          // latched PC of this instruction
+  logic [31:0] if_ex_pc_plus_n;   // latched PC+2 or PC+4 (return address)
+  logic        if_ex_valid;       // 0 = bubble/NOP
 
-  logic flush_if_ex;            // flush strobe (computed in EX)
+  logic flush_if_ex;              // flush strobe (computed in EX)
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       if_ex_instr     <= NOP_INSTR;
       if_ex_pc        <= 32'h0;
-      if_ex_pc_plus_4 <= 32'd4;
+      if_ex_pc_plus_n <= 32'd4;
       if_ex_valid     <= 1'b0;
     end else if (flush_if_ex) begin
       // Insert NOP bubble; PC fields are don't-care but zeroed for tidiness
       if_ex_instr     <= NOP_INSTR;
       if_ex_pc        <= 32'h0;
-      if_ex_pc_plus_4 <= 32'd4;
+      if_ex_pc_plus_n <= 32'd4;
       if_ex_valid     <= 1'b0;
     end else begin
-      if_ex_instr     <= instr_data_i;
+      if_ex_instr     <= expanded_instr;  // M2c: expanded instruction
       if_ex_pc        <= pc_reg;
-      if_ex_pc_plus_4 <= pc_plus_4;
+      if_ex_pc_plus_n <= pc_increment;     // M2c: PC+2 or PC+4
       if_ex_valid     <= 1'b1;
+    end
+  end
+
+  // ==========================================================================
+  // IF stage — alignment buffer (M2c)
+  // Holds the upper halfword of a fetched word when the lower half was a
+  // compressed instruction. Cleared on reset and flush.
+  // 4 cases per cycle (canonical-reference.md §12.6):
+  //   !upper_valid, is_compressed:  store upper half, upper_valid <- 1
+  //   !upper_valid, !is_compressed: word-aligned 32-bit; clear buffer
+  //   upper_valid, is_compressed:   consumed upper_buf; clear buffer
+  //   upper_valid, !is_compressed:  straddling 32-bit; store new upper half
+  // ==========================================================================
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      upper_buf   <= 16'h0;
+      upper_valid <= 1'b0;
+    end else if (flush_if_ex) begin
+      upper_buf   <= 16'h0;
+      upper_valid <= 1'b0;
+    end else if (is_compressed && !upper_valid) begin
+      // Lower half was compressed; save upper half for next cycle
+      upper_buf   <= instr_data_i[31:16];
+      upper_valid <= 1'b1;
+    end else if (is_compressed && upper_valid) begin
+      // Consumed the buffered halfword; buffer now empty
+      upper_valid <= 1'b0;
+    end else if (!is_compressed && upper_valid) begin
+      // Straddling 32-bit consumed upper_buf; save new upper half
+      upper_buf   <= instr_data_i[31:16];
+      upper_valid <= 1'b1;
+    end else begin
+      // Word-aligned 32-bit; no buffering needed
+      upper_valid <= 1'b0;
     end
   end
 
@@ -1124,14 +1956,16 @@ module pipeline_top (
   logic [4:0] ex_rs1_addr;
   logic [4:0] ex_rs2_addr;
   logic [2:0] ex_funct3;
-  logic       ex_funct7b5;
+  logic       ex_funct7b5; // kept for reference; alu_control now uses ex_funct7
+  logic [6:0] ex_funct7;
 
   assign ex_opcode   = if_ex_instr[6:0];
   assign ex_rd_addr  = if_ex_instr[11:7];
   assign ex_rs1_addr = if_ex_instr[19:15];
   assign ex_rs2_addr = if_ex_instr[24:20];
   assign ex_funct3   = if_ex_instr[14:12];
-  assign ex_funct7b5 = if_ex_instr[30];    // funct7[5]
+  assign ex_funct7b5 = if_ex_instr[30];    // funct7[5] — retained for debug
+  assign ex_funct7   = if_ex_instr[31:25]; // full funct7 for CUSTOM-0 decode
 
   // ==========================================================================
   // EX stage — control decoder outputs
@@ -1267,7 +2101,8 @@ module pipeline_top (
   alu_control alu_ctrl_unit (
     .alu_op_i   (ex_alu_op),
     .funct3_i   (ex_funct3),
-    .funct7b5_i (ex_funct7b5),
+    .funct7_i   (ex_funct7),
+    .opcode_i   (ex_opcode),
     .alu_ctrl_o (alu_ctrl),
     .illegal_o  (alu_ctrl_illegal)
   );
@@ -1359,7 +2194,7 @@ module pipeline_top (
     // Default prevents latch inference (gotcha #1)
     ex_write_data = alu_result;
     if (ex_jump)
-      ex_write_data = if_ex_pc_plus_4; // JAL/JALR: rd = return address PC+4
+      ex_write_data = if_ex_pc_plus_n; // JAL/JALR: rd = return address (M2c)
     else if (ex_mem_to_reg)
       ex_write_data = load_data;       // load: rd = sign/zero-extended data
     else
@@ -1373,8 +2208,8 @@ module pipeline_top (
   // ==========================================================================
 
   always_comb begin
-    // Default: sequential execution
-    pc_next = pc_plus_4;
+    // Default: sequential execution (M2c: increment by 2 or 4)
+    pc_next = pc_increment;
     if (ex_branch && branch_taken && if_ex_valid)
       pc_next = branch_target;           // taken branch: PC + B-imm
     else if (ex_jump && !ex_jalr && if_ex_valid)
@@ -1382,7 +2217,7 @@ module pipeline_top (
     else if (ex_jump && ex_jalr && if_ex_valid)
       pc_next = jalr_target;            // JALR: {(rs1+imm)[31:1], 1'b0}
     else
-      pc_next = pc_plus_4;              // sequential
+      pc_next = pc_increment;           // sequential (M2c: 2 or 4)
   end
 
   // ==========================================================================

@@ -1,15 +1,14 @@
 # Spec Agent — Canonical Reference
 
 > **Purpose:** This is the single source of truth for the RV32I processor design. Every encoding, signal definition, and architectural decision lives here.
-> **Last updated:** April 8, 2026
+> **Last updated:** April 14, 2026
 
 > **M0 SCOPE (confirmed by ar, April 2026):** instruction → decode → regfile read → ALU → regfile writeback. No PC, no instruction memory, no data memory, no branches, no loads/stores, no hazard logic. Modules: alu.sv, regfile.sv, imm_gen.sv, control_decoder.sv, alu_control.sv, datapath_m0.sv.
 >
 > **⚠ UNRESOLVED ITEMS** (do not treat as settled until confirmed with ar):
-> - Custom instruction set beyond POPCOUNT + BREV is TBD (CLZ vs BEXT vs BDEP)
-> - M1 scope: vanilla RV32I only, or includes custom extensions?
-> - ALU encoding table is authoritative for base RV32I; extension encodings (1010+) may change
+> - Custom instruction set: POPCOUNT, BREV, CLZ confirmed and implemented. BEXT and BDEP reserved but not yet implemented. MAC simplified to MUL16S (no accumulator).
 > - Halt pin: single `halt` output = OR(halt_o, illegal_instr_o), or two separate pads? (not blocking M0)
+> - 4-bit alu_ctrl space is fully exhausted (§8.3). Any future instruction requires expanding to 5 bits.
 
 ---
 
@@ -303,18 +302,23 @@ No load-use stall is needed because memory access occurs in EX — loaded data i
 | BREV        | 0000001   | 000    | rd = bitreverse(rs1) | 4'b1011 | Bit reversal |
 | BEXT        | 0000010   | 000    | rd = bext(rs1, rs2) | 4'b1100 | Bit extract (scatter/gather) |
 | BDEP        | 0000011   | 000    | rd = bdep(rs1, rs2) | 4'b1101 | Bit deposit (scatter/gather inverse) |
+| CLZ         | 0000101   | 000    | rd = clz(rs1) | 4'b1111 | Count leading zeros (0-32; 32 when rs1=0) |
 
-**Design note:** POPCOUNT and BREV are unary (use rs1 only; rs2 ignored). BEXT and BDEP are binary (use both rs1 and rs2).
+**Design note:** POPCOUNT, BREV, and CLZ are unary (use rs1 only; rs2 ignored). BEXT and BDEP are binary (use both rs1 and rs2). CLZ result is 32 when rs1=0 (all zeros), 0 when rs1[31]=1.
 
-### 8.2 M2b — MAC (Stretch Goal)
+### 8.2 M2b — MUL16S (16×16 Signed Multiply)
 
 | Instruction | funct7    | funct3 | Operation | alu_ctrl | Description |
 |-------------|-----------|--------|-----------|----------|-------------|
-| MAC         | 0000100   | 000    | rd = rs1[15:0] × rs2[15:0] + rd_old | 4'b1110 | 16×16→32 multiply-accumulate |
+| MUL16S      | 0000100   | 000    | rd = sext(rs1[15:0]) × sext(rs2[15:0]) | 4'b1110 | Signed 16×16→32 multiply |
 
 **Scoped to 16×16 deliberately** — keeps it single-cycle at 50MHz on 180nm. A 32×32 multiplier would require multi-cycle or pipelining the accelerator itself.
 
-**MAC reads rd as an accumulator input.** This is a 3-read-port operation (rs1, rs2, rd_old). The register file has 2 read ports. Options: (a) add a third read port, (b) read rd in a prior cycle and latch it, (c) use a dedicated accumulator register. **This is an open design decision.**
+**No accumulator.** Originally designed as MAC (multiply-accumulate), simplified to multiply-only to avoid a 3-read-port register file. Software handles accumulation: `MUL16S rd_temp, rs1, rs2` then `ADD rd, rd, rd_temp`. This is the same approach as the RISC-V M extension (MUL separate from ADD).
+
+**Signed operands.** rs1[15:0] and rs2[15:0] are sign-extended to 32 bits before multiplication. Signed is more generally useful for DSP workloads (FIR filters, dot products).
+
+**RTL constraint:** No `*` operator in synthesizable RTL. Must use a combinational partial-product tree (Wallace tree or balanced adder tree). A naive 16-serial-adder chain will NOT meet timing at 50 MHz / 180nm. The parallel tree structure compresses to ~4 adder levels (~6-8 ns), well within the 20 ns period.
 
 ### 8.3 Reserved alu_ctrl Codes
 
@@ -325,8 +329,10 @@ No load-use stall is needed because memory access occurs in EX — loaded data i
 | 4'b1011 | M2a: BREV |
 | 4'b1100 | M2a: BEXT |
 | 4'b1101 | M2a: BDEP |
-| 4'b1110 | M2b: MAC |
-| 4'b1111 | **Unallocated — reserved for future use** |
+| 4'b1110 | M2b: MUL16S |
+| 4'b1111 | M2a: CLZ |
+
+**Note:** The 4-bit alu_ctrl space is now fully exhausted. Any future custom instruction requires expanding alu_ctrl to 5 bits.
 
 ---
 
@@ -387,6 +393,388 @@ These are the golden reference values that testbenches should check against:
 **Max negative I-imm:** `32'h800` sign-extended = `32'hFFFFF800` = -2048
 **LUI 0xDEADB:** `32'hDEADB137` → rd = `32'hDEADB000`
 **AUIPC at PC=0x100, imm=0x12345:** rd = `0x100 + 0x12345000` = `0x12345100`
+
+---
+
+## 12. RV32C — Compressed Instructions (M2c)
+
+> **Status:** QC-passed and pipeline-integrated (April 2026). Verified with 220 decoder unit vectors + 41 pipeline integration vectors. This section is normative for `compressed_decoder` and the IF-stage alignment buffer.
+
+### 12.1 Overview
+
+RV32C instructions are **16-bit encodings** that expand to a canonical 32-bit RV32I instruction before entering the pipeline. The expansion is purely combinational and happens in the IF stage; the rest of the pipeline sees only 32-bit instructions.
+
+**Quadrant identification:** bits [1:0] of every instruction word.
+
+| inst[1:0] | Quadrant | Name |
+|-----------|----------|------|
+| `00`      | Q0       | C0   |
+| `01`      | Q1       | C1   |
+| `10`      | Q2       | C2   |
+| `11`      | —        | 32-bit (not compressed) |
+
+⚠ **A 16-bit word of `16'h0000` (all zeros) is always illegal**, regardless of quadrant. The decoder explicitly asserts `illegal_o=1` for this encoding.
+
+**Primary decode key:** `{inst[15:13], inst[1:0]}` — a 5-bit value that selects the instruction within a quadrant.
+
+**Instruction count supported:** 25 RV32C instructions (all architecturally defined RV32C encodings except floating-point, which are marked illegal in this implementation).
+
+---
+
+### 12.2 Compressed Instruction Formats — Bit Layouts
+
+All widths are 16 bits. Fields that span non-contiguous bit positions are shown explicitly.
+
+```
+CR-format  (register):
+  [15:12 funct4 | 11:7 rd/rs1 | 6:2 rs2 | 1:0 op]
+
+CI-format  (immediate):
+  [15:13 funct3 | 12 imm[part] | 11:7 rd/rs1 | 6:2 imm[part] | 1:0 op]
+
+CSS-format (stack-relative store):
+  [15:13 funct3 | 12:7 uimm | 6:2 rs2 | 1:0 op]
+
+CIW-format (wide immediate):
+  [15:13 funct3 | 12:5 nzuimm | 4:2 rd' | 1:0 op]
+
+CL-format  (load):
+  [15:13 funct3 | 12:10 uimm[part] | 9:7 rs1' | 6:5 uimm[part] | 4:2 rd' | 1:0 op]
+
+CS-format  (store):
+  [15:13 funct3 | 12:10 uimm[part] | 9:7 rs1' | 6:5 uimm[part] | 4:2 rs2' | 1:0 op]
+
+CB-format  (branch / shift / ANDI):
+  [15:13 funct3 | 12:10 offset/funct2+shamt | 9:7 rs1' | 6:2 offset/imm | 1:0 op]
+
+CJ-format  (jump):
+  [15:13 funct3 | 12:2 jump-target | 1:0 op]
+```
+
+**Compressed register notation:**
+- `rd'`, `rs1'`, `rs2'` (primed) — 3-bit encoded, map to x8–x15 (see §12.6).
+- `rd`, `rs1`, `rs2` (unprimed) — full 5-bit encoded, can address x0–x31.
+
+---
+
+### 12.3 Quadrant 0 (C0) — `inst[1:0] = 00`
+
+Decode key: `inst[15:13]`
+
+| inst[15:13] | Instruction    | Format | Expansion | Notes |
+|-------------|----------------|--------|-----------|-------|
+| `000`       | C.ADDI4SPN     | CIW    | `ADDI rd', x2, nzuimm` | nzuimm=0 → **illegal** |
+| `001`       | _(C.FLD)_      | —      | **illegal** | F-extension; not implemented |
+| `010`       | C.LW           | CL     | `LW rd', uimm(rs1')` | |
+| `011`       | _(C.FLW)_      | —      | **illegal** | F-extension; not implemented |
+| `100`       | _(reserved)_   | —      | **illegal** | Architecturally reserved in C0 |
+| `101`       | _(C.FSD)_      | —      | **illegal** | F-extension; not implemented |
+| `110`       | C.SW           | CS     | `SW rs2', uimm(rs1')` | |
+| `111`       | _(C.FSW)_      | —      | **illegal** | F-extension; not implemented |
+
+**C.ADDI4SPN immediate reconstruction** — produces a 10-bit non-zero unsigned immediate scaled by 1 (byte offset):
+
+```
+nzuimm[9:2] = { inst[10:7], inst[12:11], inst[5], inst[6] }
+nzuimm[1:0] = 2'b00  (word-aligned; always zero)
+12-bit zero-extended: { 2'b00, inst[10:7], inst[12:11], inst[5], inst[6], 2'b00 }
+```
+
+**C.LW / C.SW offset reconstruction** — 7-bit unsigned, word-aligned:
+
+```
+uimm[6:0] = { inst[5], inst[12:10], inst[6], 2'b00 }
+```
+
+Zero-extended to 12 bits for I-type (LW); split across imm[11:5]/imm[4:0] for S-type (SW).
+
+---
+
+### 12.4 Quadrant 1 (C1) — `inst[1:0] = 01`
+
+Decode key: `inst[15:13]`
+
+| inst[15:13] | Instruction      | Format | Expansion | Notes |
+|-------------|------------------|--------|-----------|-------|
+| `000`       | C.NOP / C.ADDI   | CI     | `ADDI rd, rd, sext(nzimm)` | rd=x0 or imm=0 → HINT (expands to valid ADDI; see Note A) |
+| `001`       | C.JAL            | CJ     | `JAL x1, sext(offset)` | RV32 only; RV64 encodes C.ADDIW here |
+| `010`       | C.LI             | CI     | `ADDI rd, x0, sext(imm)` | |
+| `011`       | C.LUI / C.ADDI16SP | CI   | See Note B | rd=x2 → C.ADDI16SP; rd=x0 → HINT (NOP); else C.LUI |
+| `100`       | C.SRLI / C.SRAI / C.ANDI / arithmetic | CB/CR | See §12.4.1 | Sub-decoded by inst[11:10] |
+| `101`       | C.J              | CJ     | `JAL x0, sext(offset)` | Unconditional jump; discards link |
+| `110`       | C.BEQZ           | CB     | `BEQ rs1', x0, sext(offset)` | |
+| `111`       | C.BNEZ           | CB     | `BNE rs1', x0, sext(offset)` | |
+
+**Note A — C.NOP / C.ADDI HINT behavior:** The decoder always produces `ADDI rd, rd, sext(nzimm)` regardless of HINT conditions. When rd=x0 (any imm) or imm=0 (any rd), this is architecturally a HINT; the expansion is correct because `ADDI x0, x0, 0` = NOP and `ADDI rd, rd, 0` is a no-op to any register.
+
+**Note B — C.LUI / C.ADDI16SP disambiguation:**
+- `rd = x2`: C.ADDI16SP → `ADDI x2, x2, sext(nzimm×16)`. nzimm=0 → **illegal**.
+- `rd = x0`: HINT → expands to NOP (`32'h00000013`).
+- `rd ≠ x0, x2`: C.LUI → `LUI rd, nzimm[17:12]`. nzimm=0 → **illegal**.
+
+**C.ADDI / C.LI / C.ANDI shared immediate** — 6-bit signed, sign-extended to 12 bits:
+
+```
+imm[5:0] = { inst[12], inst[6:2] }
+12-bit sign-extended: { {6{inst[12]}}, inst[12], inst[6:2] }
+```
+
+**C.ADDI16SP immediate** — 10-bit signed, word-aligned by 16:
+
+```
+nzimm[9:0] = { inst[12], inst[4:3], inst[5], inst[2], inst[6], 4'b0000 }
+12-bit sign-extended: { {2{inst[12]}}, inst[12], inst[4:3], inst[5], inst[2], inst[6], 4'b0000 }
+```
+
+**C.LUI immediate** — 6-bit nzimm placed in bits [17:12] of U-type upper immediate:
+
+```
+nzimm[17:12] = { inst[12], inst[6:2] }
+20-bit U-type: { {14{inst[12]}}, inst[12], inst[6:2] }   (sign-extended to fill bits [31:12])
+```
+
+**C.JAL / C.J jump offset** — 12-bit signed offset, reconstructed as a 21-bit J-type immediate:
+
+```
+offset raw bits (bit positions in the logical 12-bit value):
+  bit[11] = inst[12]   (sign)
+  bit[10] = inst[8]
+  bit[9]  = inst[10]
+  bit[8]  = inst[9]
+  bit[7]  = inst[6]
+  bit[6]  = inst[7]
+  bit[5]  = inst[2]
+  bit[4]  = inst[11]
+  bit[3]  = inst[5]
+  bit[2]  = inst[4]
+  bit[1]  = inst[3]
+  bit[0]  = 1'b0       (×2 alignment)
+
+21-bit J-type immediate (direct wire mapping for RV32I JAL encoding):
+  imm_jal_21 = { {9{inst[12]}}, inst[12], inst[8], inst[10:9],
+                  inst[6], inst[7], inst[2], inst[11], inst[5:3], 1'b0 }
+```
+
+**C.BEQZ / C.BNEZ branch offset** — 9-bit signed offset, reconstructed as a 13-bit B-type immediate:
+
+```
+offset raw bits (bit positions in the logical 9-bit value):
+  bit[8] = inst[12]   (sign)
+  bit[7] = inst[6]
+  bit[6] = inst[5]
+  bit[5] = inst[2]
+  bit[4] = inst[11]
+  bit[3] = inst[10]
+  bit[2] = inst[4]
+  bit[1] = inst[3]
+  bit[0] = 1'b0       (×2 alignment)
+
+13-bit B-type immediate (direct wire mapping for RV32I BEQ/BNE encoding):
+  imm_br_13 = { {4{inst[12]}}, inst[12], inst[6:5], inst[2],
+                 inst[11:10], inst[4:3], 1'b0 }
+```
+
+#### 12.4.1 C1 funct3=100 Sub-decode (inst[11:10])
+
+| inst[11:10] | Instruction | Expansion | Notes |
+|-------------|-------------|-----------|-------|
+| `00`        | C.SRLI      | `SRLI rd', rd', shamt` | shamt[5]=inst[12]=1 → **illegal** on RV32 |
+| `01`        | C.SRAI      | `SRAI rd', rd', shamt` | shamt[5]=inst[12]=1 → **illegal** on RV32 |
+| `10`        | C.ANDI      | `ANDI rd', rd', sext(imm)` | imm from shared 6-bit field |
+| `11`        | C.SUB / C.XOR / C.OR / C.AND | See §12.4.2 | inst[12]=1 → **illegal** (RV64-only encodings) |
+
+**SRLI / SRAI shamt field:**
+
+```
+shamt[5:0] = { inst[12], inst[6:2] }
+```
+
+⚠ shamt[5] (= inst[12]) **must be 0** on RV32. shamt[5]=1 is illegal for C.SRLI, C.SRAI, and C.SLLI (§12.7).
+
+#### 12.4.2 C1 funct3=100, inst[11:10]=11 Sub-decode (inst[12]=0 required, inst[6:5])
+
+| inst[12] | inst[6:5] | Instruction | Expansion |
+|----------|-----------|-------------|-----------|
+| `0`      | `00`      | C.SUB       | `SUB rd', rd', rs2'` |
+| `0`      | `01`      | C.XOR       | `XOR rd', rd', rs2'` |
+| `0`      | `10`      | C.OR        | `OR  rd', rd', rs2'` |
+| `0`      | `11`      | C.AND       | `AND rd', rd', rs2'` |
+| `1`      | any       | _(C.SUBW / C.ADDW)_ | **illegal** — RV64 encodings, not valid on RV32 |
+
+---
+
+### 12.5 Quadrant 2 (C2) — `inst[1:0] = 10`
+
+Decode key: `inst[15:13]`
+
+| inst[15:13] | Instruction     | Format | Expansion | Notes |
+|-------------|-----------------|--------|-----------|-------|
+| `000`       | C.SLLI          | CI     | `SLLI rd, rd, shamt` | shamt[5]=inst[12]=1 → **illegal** on RV32; rd=x0 is HINT |
+| `001`       | _(C.FLDSP)_     | —      | **illegal** | F-extension; not implemented |
+| `010`       | C.LWSP          | CI     | `LW rd, uimm(x2)` | rd=x0 → **illegal** |
+| `011`       | _(C.FLWSP)_     | —      | **illegal** | F-extension; not implemented |
+| `100`       | C.JR / C.MV / C.EBREAK / C.JALR / C.ADD | CR | See §12.5.1 | |
+| `101`       | _(C.FSDSP)_     | —      | **illegal** | F-extension; not implemented |
+| `110`       | C.SWSP          | CSS    | `SW rs2, uimm(x2)` | |
+| `111`       | _(C.FSWSP)_     | —      | **illegal** | F-extension; not implemented |
+
+**C.SLLI shamt** — same 6-bit field as SRLI/SRAI (see §12.4.1). shamt[5]=1 → **illegal**.
+
+**C.LWSP offset** — 8-bit unsigned, word-aligned:
+
+```
+uimm[7:0] = { inst[3:2], inst[12], inst[6:4], 2'b00 }
+12-bit zero-extended: { 4'b0000, inst[3:2], inst[12], inst[6:4], 2'b00 }
+```
+
+**C.SWSP offset** — 8-bit unsigned, word-aligned:
+
+```
+uimm[7:0] = { inst[8:7], inst[12:9], 2'b00 }
+S-type split: imm[11:5] = { 4'b0000, uimm[7:5] }
+              imm[4:0]  = uimm[4:0]
+```
+
+#### 12.5.1 C2 funct3=100 Sub-decode (inst[12], inst[6:2])
+
+| inst[12] | inst[11:7] (rd) | inst[6:2] (rs2) | Instruction | Expansion |
+|----------|-----------------|-----------------|-------------|-----------|
+| `0`      | ≠ x0            | = 0             | C.JR        | `JALR x0, 0(rs1)` — indirect jump, no link |
+| `0`      | x0              | = 0             | _(reserved)_ | **illegal** |
+| `0`      | any             | ≠ 0             | C.MV        | `ADD rd, x0, rs2` — register copy |
+| `1`      | = x0            | = 0             | C.EBREAK    | `EBREAK` (= `32'h00100073`) |
+| `1`      | ≠ x0            | = 0             | C.JALR      | `JALR x1, 0(rs1)` — indirect call, link to x1 |
+| `1`      | any             | ≠ 0             | C.ADD       | `ADD rd, rd, rs2` |
+
+**Register fields for C2 funct3=100:** `rd` and `rs2` use the **full 5-bit** unprimed encoding:
+- `rd` / `rs1` = inst[11:7]
+- `rs2` = inst[6:2]
+
+---
+
+### 12.6 Compressed Register Mapping
+
+Compressed instructions with primed register operands (`rd'`, `rs1'`, `rs2'`) encode a 3-bit register index that maps to the integer registers x8–x15.
+
+| 3-bit encoding | Register | ABI name |
+|----------------|----------|----------|
+| `000`          | x8       | s0/fp    |
+| `001`          | x9       | s1       |
+| `010`          | x10      | a0       |
+| `011`          | x11      | a1       |
+| `100`          | x12      | a2       |
+| `101`          | x13      | a3       |
+| `110`          | x14      | a4       |
+| `111`          | x15      | a5       |
+
+**Bit positions per format:**
+- `rd'`  = inst[4:2], expanded as `{2'b01, inst[4:2]}`
+- `rs1'` = inst[9:7], expanded as `{2'b01, inst[9:7]}`
+- `rs2'` = inst[4:2], expanded as `{2'b01, inst[4:2]}` (same bits as rd' in CS/CL formats)
+
+---
+
+### 12.7 Illegal / Reserved Instruction Conditions
+
+All conditions below cause `illegal_o = 1` from `compressed_decoder`. The pipeline treats `illegal_o` identically to `illegal_instr_o` from the 32-bit control decoder — both assert `halt_o`.
+
+| Rule | Encoding | Condition | Reason |
+|------|----------|-----------|--------|
+| 1    | Any quadrant | `instr_i == 16'h0000` | All-zeros is architecturally defined as illegal |
+| 2    | C0: inst[15:13] = 001, 011, 101, 111 | Always | C.FLD, C.FLW, C.FSD, C.FSW — F-extension, not implemented |
+| 2b   | C0: inst[15:13] = 100 | Always | Architecturally reserved in C0 |
+| 3    | C2: inst[15:13] = 001, 011, 101, 111 | Always | C.FLDSP, C.FLWSP, C.FSDSP, C.FSWSP — F-extension, not implemented |
+| 4    | C.ADDI4SPN (C0/000) | nzuimm = 0 | Spec requires non-zero immediate |
+| 5    | C.ADDI16SP (C1/011, rd=x2) | nzimm = 0 | Spec requires non-zero immediate |
+| 6    | C.LUI (C1/011, rd≠x0,x2) | nzimm = 0 | Spec requires non-zero immediate |
+| 7    | C.LWSP (C2/010) | rd = x0 | Loading into x0 is architecturally reserved |
+| 8    | C.JR (C2/100, inst[12]=0, rs2=0) | rd/rs1 = x0 | Jumping to address in x0 is reserved |
+| 9    | **C.SLLI** (C2/000) | **shamt[5] = inst[12] = 1** | **RV32: shift amount > 31 is illegal** |
+| 9    | **C.SRLI** (C1/100, inst[11:10]=00) | **shamt[5] = inst[12] = 1** | **RV32: shift amount > 31 is illegal** |
+| 9    | **C.SRAI** (C1/100, inst[11:10]=01) | **shamt[5] = inst[12] = 1** | **RV32: shift amount > 31 is illegal** |
+| 10   | C1/100, inst[11:10]=11 | inst[12] = 1 | Encodes C.SUBW/C.ADDW (RV64 only) — illegal on RV32 |
+
+⚠ **Rule 9 applies to all three shift instructions.** All use the same shamt field `{inst[12], inst[6:2]}`. The shamt[5]=1 check is evaluated identically for C.SLLI, C.SRLI, and C.SRAI.
+
+---
+
+### 12.8 Pipeline Integration — IF-Stage Alignment Buffer
+
+#### 12.8.1 Architecture
+
+The alignment buffer allows zero-stall decode of any mix of 16-bit and 32-bit instructions. It consists of **17 flip-flops**:
+- `upper_buf[15:0]` — 16-bit register holding the saved upper halfword of a previously fetched 32-bit word
+- `upper_valid` — 1-bit flag indicating `upper_buf` holds a valid halfword
+
+The instruction memory interface fetches **32-bit aligned words** at all times. The PC may point to a halfword-aligned address when executing compressed instructions.
+
+#### 12.8.2 Instruction Memory Address Computation
+
+```
+instr_addr_o = upper_valid ? { pc_reg[31:2] + 30'd1, 2'b00 }
+                            : { pc_reg[31:2], 2'b00 }
+```
+
+When `upper_valid=1`, the upper half of the previously fetched word is already buffered, so the memory must supply the **next** word (PC+4 aligned). When `upper_valid=0`, the fetch address is the word containing PC.
+
+#### 12.8.3 Compression Detection and Halfword Selection
+
+```
+selected_hw   = upper_valid ? upper_buf : instr_data_i[15:0]
+is_compressed = (selected_hw[1:0] != 2'b11)
+```
+
+The halfword being processed this cycle is always `selected_hw`. `is_compressed` is determined purely by bits [1:0] of that halfword.
+
+#### 12.8.4 Raw Instruction Assembly (pre-expansion)
+
+Three cases, evaluated combinationally:
+
+| Case | Condition | raw_instr |
+|------|-----------|-----------|
+| Compressed | `is_compressed` | `{16'h0000, selected_hw}` — upper 16 bits unused; decoder sees [15:0] |
+| Straddling 32-bit | `!is_compressed && upper_valid` | `{instr_data_i[15:0], upper_buf}` — upper buf is low half, new fetch is high half |
+| Word-aligned 32-bit | `!is_compressed && !upper_valid` | `instr_data_i` — direct from memory |
+
+The `compressed_decoder` receives `selected_hw` (not `raw_instr`) and produces `expanded_instr_c`. The final instruction sent to the IF/EX register is:
+
+```
+expanded_instr = is_compressed ? expanded_instr_c : raw_instr
+```
+
+#### 12.8.5 Alignment Buffer State Transitions
+
+The buffer is updated on every cycle (synchronous, async reset). A flush (taken branch or jump) clears the buffer immediately.
+
+| Condition | Next state |
+|-----------|------------|
+| Reset or flush | `upper_valid ← 0`, `upper_buf ← 0` |
+| `is_compressed && !upper_valid` | Lower half was compressed; **save upper half**: `upper_buf ← instr_data_i[31:16]`, `upper_valid ← 1` |
+| `is_compressed && upper_valid` | Consumed the buffered halfword; **clear**: `upper_valid ← 0` |
+| `!is_compressed && upper_valid` | Straddling 32-bit consumed `upper_buf`; **save new upper half**: `upper_buf ← instr_data_i[31:16]`, `upper_valid ← 1` |
+| `!is_compressed && !upper_valid` | Word-aligned 32-bit; **no buffering**: `upper_valid ← 0` |
+
+#### 12.8.6 PC Increment
+
+```
+pc_plus_2   = pc_reg + 32'd2
+pc_increment = is_compressed ? pc_plus_2 : pc_plus_4
+```
+
+The IF/EX pipeline register latches `pc_increment` as `if_ex_pc_plus_n`, which serves as the return address for compressed JAL/JALR (C.JAL, C.JALR) — they write `PC+2` to the link register, not `PC+4`.
+
+#### 12.8.7 Zero-Stall Property
+
+The alignment buffer delivers **one instruction per cycle** with no pipeline stalls for mixed 16-bit/32-bit streams. The only stall case that exists in the design is the pre-existing 1-cycle branch/jump flush (§7.3), which is unchanged. There is no fetch stall caused by compressed instructions.
+
+#### 12.8.8 Flush Behavior
+
+On `flush_if_ex`:
+1. The IF/EX pipeline register is cleared to NOP (`32'h00000013`, valid=0).
+2. The alignment buffer is reset (`upper_valid ← 0`).
+3. The PC is updated to the branch/jump target.
+
+This ensures that a stale buffered halfword from before the flush does not contaminate the instruction stream after the redirect.
 
 ---
 

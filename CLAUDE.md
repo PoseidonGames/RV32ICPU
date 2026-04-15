@@ -4,20 +4,21 @@
 - **Designer:** Beaux Cable | **Senior Lead:** ar
 - **Target:** TSMC 180nm, 1mm × 1mm die, 50 MHz clock
 - **Tapeout:** June 17, 2026 | **Hard gate:** May 15 — DRC/LVS clean or cut from shuttle
-- **Architecture:** 3-stage pipeline (IF → EX → WB), FF register file, no SRAM, no caches
+- **Architecture:** 3-stage pipeline (IF → EX → WB), FF register file + small FF imem/dmem, MMIO wrapper interface
 
 ## Current State
-- **Done:** M0 (single-cycle, Apr 9) → M1 (3-stage pipeline, Apr 13 — P&R + PT signoff on FreePDK-45nm)
-- **Next:** I/O pads → M2a (custom instructions) → M2b (MAC accelerator) → TSMC 180nm flow → DRC/LVS signoff
+- **Done:** M0 (single-cycle, Apr 9) → M1 (3-stage pipeline, Apr 13) → M2a (POPCOUNT+BREV+CLZ, Apr 14) → M2b (MUL16S, Apr 14) → M2c (RV32C compressed, Apr 14)
+- **Next:** I/O pads → M1-wrap (MMIO wrapper) → TSMC 180nm flow → DRC/LVS signoff
 - **180nm PDK:** Expected week of Apr 13, 2026
 
 ## Milestones
 - **M0** — Single-cycle datapath (DONE Apr 9)
 - **M1** — 3-stage pipeline, vanilla RV32I (DONE Apr 13, FreePDK-45nm through step 16)
-- **M1-pads** — I/O pad ring for 1mm×1mm die, pin assignment
-- **M2a** — Custom instructions: POPCOUNT + BREV confirmed; CLZ vs BEXT vs BDEP TBD (need ar)
-- **M2b** — MAC accelerator (shift-add, no `*` operator) — stretch goal
+- **M1-wrap** — MMIO wrapper for chipstitch site handoff (no pad ring — TSI provides floorplan template)
+- **M2a** — Custom instructions: POPCOUNT + BREV + CLZ (DONE Apr 14, 2672 vectors passing)
+- **M2b** — MUL16S signed 16×16 multiply, shift-add, no `*` operator (DONE Apr 14, 2672 vectors passing)
 - **M1-180nm** — Re-run M1 flow on TSMC 180nm PDK (when available)
+- **M3** — SRAM integration (reach goal, after M2 complete; ar will provide SRAM compiler)
 - **Signoff** — DRC/LVS clean on 180nm (hard gate: May 15)
 
 ## Agent Workflow
@@ -47,11 +48,11 @@ Per-module flow: RTL agent writes → QC agent reviews (isolated) → fix loop �
 ## Hard Constraints
 - **NDA:** Never paste 180nm PDK data (.lib, .lef, .spf, .tf) into any AI tool
 - **No `*` operator** in synthesizable RTL (MAC must use explicit shift-add)
-- **No SRAM** — FF register file only, external memory via I/O pads
+- **No SRAM until M3** — FF-based imem/dmem for M1-M2, SRAM is reach goal only
 - **Backup plan:** If CPU too ambitious by end of Week 2, pivot to AES-128 or FIR filter
 
 ## Unresolved (need ar's input before committing)
-- Custom instruction set: POPCOUNT + BREV confirmed, but CLZ vs BEXT vs BDEP TBD
 - Encoding sharing: shared package vs per-module localparams?
-- MAC accelerator interface: memory-mapped vs dedicated instruction vs coprocessor port
-- Pad ring: power/ground pad count, ESD strategy, pin assignment constraints
+- 4-bit alu_ctrl space is fully exhausted; BEXT/BDEP would require expanding to 5 bits
+- Chipstitch handoff spec: ar will provide floorplan template and pin assignment constraints (no custom pads)
+- On-chip memory sizing: how many words of FF imem/dmem are feasible at 180nm on 1mm²
