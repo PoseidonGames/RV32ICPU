@@ -31,16 +31,6 @@ m1_4_13_26_genlibdb/
 # Misc build artifacts
 m0_d2_flow_guide.html
 
-# Standalone module copies (canonical source is flow/rtl/outputs/design.v)
-/branch_comparator.sv
-/forwarding_unit.sv
-/load_store_unit.sv
-/pipeline_top.sv
-flow/rtl/branch_comparator.sv
-flow/rtl/forwarding_unit.sv
-flow/rtl/load_store_unit.sv
-flow/rtl/pipeline_top.sv
-
 # Course materials / screenshots
 *.pdf
 screenshots/
