@@ -7,14 +7,14 @@
 - **Architecture:** 3-stage pipeline (IF → EX → WB), FF register file + small FF imem/dmem, MMIO wrapper interface
 
 ## Current State
-- **Done:** M0 (single-cycle, Apr 9) → M1 (3-stage pipeline, Apr 13) → M2a (POPCOUNT+BREV+CLZ, Apr 14) → M2b (MUL16S, Apr 14) → M2c (RV32C compressed, Apr 14)
-- **Next:** I/O pads → M1-wrap (MMIO wrapper) → TSMC 180nm flow → DRC/LVS signoff
+- **Done:** M0 (single-cycle, Apr 9) → M1 (3-stage pipeline, Apr 13) → M2a (POPCOUNT+BREV+CLZ, Apr 14) → M2b (MUL16S, Apr 14) → M2c (RV32C compressed, Apr 14) → M2-wrap (MMIO wrapper, Apr 14)
+- **Next:** TSMC 180nm flow → DRC/LVS signoff
 - **180nm PDK:** Expected week of Apr 13, 2026
 
 ## Milestones
 - **M0** — Single-cycle datapath (DONE Apr 9)
 - **M1** — 3-stage pipeline, vanilla RV32I (DONE Apr 13, FreePDK-45nm through step 16)
-- **M1-wrap** — MMIO wrapper for chipstitch site handoff (no pad ring — TSI provides floorplan template)
+- **M2-wrap** — MMIO wrapper chip_top around pipeline_top (DONE Apr 14, 44 vectors passing)
 - **M2a** — Custom instructions: POPCOUNT + BREV + CLZ (DONE Apr 14, 2672 vectors passing)
 - **M2b** — MUL16S signed 16×16 multiply, shift-add, no `*` operator (DONE Apr 14, 2672 vectors passing)
 - **M1-180nm** — Re-run M1 flow on TSMC 180nm PDK (when available)

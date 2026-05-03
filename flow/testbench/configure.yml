@@ -5,5 +5,5 @@ outputs:
   - design.args
 
 commands:
-  - cp tb_datapath_m0.sv outputs/testbench.sv
+  - cp tb_chip_top.sv outputs/testbench.sv
   - cp design.args outputs/design.args

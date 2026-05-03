@@ -1,7 +1,7 @@
 #=========================================================================
 # construct.py
 #=========================================================================
-# M1 3-stage pipeline — TSI RV32I processor, TSMC 180nm tapeout
+# M2-wrap chip_top — TSI RV32I processor, TSMC 180nm tapeout
 # Adapted from GcdUnit demo template (construct-commercial-full.py).
 #
 # Designer : Beaux Cable
@@ -26,12 +26,12 @@ def construct():
   # Parameters
   #-----------------------------------------------------------------------
 
-  adk_name = 'freepdk-45nm'  # swap to tsmc-180nm when ChipsHub PDK is ready
+  adk_name = 'tsmc-180nm'
   adk_view = 'view-standard'
 
   parameters = {
     'construct_path' : __file__,
-    'design_name'    : 'pipeline_top',
+    'design_name'    : 'chip_top',
     'clock_period'   : 20.0,          # 50 MHz target
     'adk'            : adk_name,
     'adk_view'       : adk_view,

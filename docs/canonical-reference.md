@@ -778,4 +778,142 @@ This ensures that a stale buffered halfword from before the flush does not conta
 
 ---
 
+## 13. Chip-Level MMIO Wrapper (chip_top)
+
+> **Status:** Interface contract confirmed April 2026 (M2-wrap milestone).
+> This section is normative for `chip_top` and all testbenches that
+> exercise the MMIO interface.
+
+### 13.1 External Port Table
+
+| Port | Dir | Width | Description |
+|------|-----|-------|-------------|
+| `clk` | in | 1 | External clock |
+| `rst_n` | in | 1 | Pad-level active-low async reset (fed through reset synchronizer) |
+| `data_i` | in | 32 | Host write data bus |
+| `data_o` | out | 32 | Host read data bus |
+| `addr_cmd_i` | in | 3 | Register/command select (8 addresses, see §13.2) |
+| `wr_en_i` | in | 1 | Write strobe — captured on rising `clk` edge |
+| `rd_en_i` | in | 1 | Read strobe — combinational read; `data_o` valid same cycle |
+| `busy_o` | out | 1 | High while wrapper is processing (LOADING or RUNNING state) |
+| `done_o` | out | 1 | High when CPU has halted (DONE state) |
+
+Port naming follows `docs/conventions.md`: `_i`/`_o` suffixes on all ports except `clk` and `rst_n`.
+
+---
+
+### 13.2 Command Register Map
+
+Addressed by `addr_cmd_i[2:0]`. All registers are 32 bits wide.
+
+| addr_cmd | Register | R/W | Description |
+|----------|----------|-----|-------------|
+| `3'h0` | CMD | W | Command code (see §13.3); write triggers FSM action |
+| `3'h1` | ADDR | W | Target memory word address |
+| `3'h2` | WDATA | W | Write data for LOAD_IMEM / LOAD_DMEM commands |
+| `3'h3` | RDATA | R | Read data result from READ_DMEM / READ_IMEM commands |
+| `3'h4` | STATUS | R | `{28'b0, state[3:0]}` — current FSM state (see §13.5) |
+| `3'h5` | PC | R | Current PC: sourced from `instr_addr_o` of pipeline_top |
+| `3'h6` | CYCLE_CNT | R | 32-bit cycle counter; counts in RUNNING state only |
+| `3'h7` | (reserved) | — | Returns `32'h0`; writes ignored |
+
+Write-only registers (CMD, ADDR, WDATA) return `32'h0` on a read.
+Read-only registers (RDATA, STATUS, PC, CYCLE_CNT) ignore writes.
+
+---
+
+### 13.3 CMD Codes (`data_i[3:0]` when writing to 3'h0)
+
+| Code | Name | Action |
+|------|------|--------|
+| `4'h0` | NOP | No operation; FSM stays in current state |
+| `4'h1` | LOAD_IMEM | Write `WDATA` to `imem[ADDR]` |
+| `4'h2` | LOAD_DMEM | Write `WDATA` to `dmem[ADDR]` |
+| `4'h3` | RUN | Release pipeline_top from reset; FSM enters RUNNING |
+| `4'h4` | HALT | Force pipeline_top back into reset; FSM returns to IDLE |
+| `4'h5` | READ_DMEM | Read `dmem[ADDR]` into RDATA register |
+| `4'h6` | READ_IMEM | Read `imem[ADDR]` into RDATA register |
+
+All other codes (`4'h7`–`4'hF`) are treated as NOP.
+
+---
+
+### 13.4 Memory Architecture
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `IMEM_DEPTH` | 64 | Number of 32-bit words in instruction memory |
+| `DMEM_DEPTH` | 64 | Number of 32-bit words in data memory |
+
+Both memories are **FF-based** (no SRAM until M3). Both are
+**word-addressed**: `ADDR` register holds a word index, not a byte
+address. Combinational read. Synchronous write on `clk` rising edge.
+
+During RUNNING state, instruction memory read port is driven by
+`instr_addr_o` from pipeline_top (word index = `instr_addr_o[AW+1:2]`).
+Data memory is driven by `data_addr_o[AW+1:2]` for reads and writes
+with `data_we_o[3:0]` byte-lane enables.
+
+---
+
+### 13.5 FSM States and Transitions
+
+States encoded as `logic [3:0]` to match STATUS register layout.
+
+| State | Encoding | Description |
+|-------|----------|-------------|
+| IDLE | `4'h0` | Reset state; pipeline_top held in reset; awaiting commands |
+| LOADING | `4'h1` | Processing LOAD_IMEM or LOAD_DMEM; `busy_o = 1` |
+| RUNNING | `4'h2` | pipeline_top executing; `busy_o = 1` |
+| DONE | `4'h3` | pipeline_top halted; `done_o = 1`; `busy_o = 0` |
+
+**Transition table:**
+
+| From | Trigger | To |
+|------|---------|----|
+| IDLE | CMD = RUN | RUNNING |
+| IDLE | CMD = LOAD_IMEM or LOAD_DMEM | LOADING |
+| LOADING | write completes (single-cycle) | IDLE |
+| RUNNING | `halt_o` asserted | DONE |
+| RUNNING | CMD = HALT | IDLE |
+| DONE | CMD = HALT | IDLE |
+| Any | `rst_n_sync` deasserted | IDLE |
+
+LOADING is a single-cycle transient state: the write to FF memory
+completes in one clock, and the FSM returns to IDLE the next cycle.
+
+---
+
+### 13.6 pipeline_top Integration
+
+**Reset control:** pipeline_top's `rst_n` is asserted (held low) in
+IDLE, LOADING, and DONE states. It is deasserted (high) only in RUNNING.
+
+**Reset synchronizer (§9.2):** Pad-level `rst_n` passes through a 2-FF
+async-assert, sync-deassert synchronizer. All chip_top sequential logic
+uses the synchronized output `rst_n_sync`.
+
+**Memory mux:** Combinational mux selects address/data/write-enable
+sources: pipeline_top in RUNNING, wrapper in all other states.
+
+**Halt latching:** `halt_o` from pipeline_top is sampled on the rising
+clock edge. The registered `halt_latched` signal drives the DONE
+transition and `done_o` output.
+
+**Cycle counter:** 32-bit counter increments every cycle in RUNNING
+state. Cleared on reset. Does not increment in other states.
+
+### 13.7 Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `IMEM_DEPTH` | integer | 64 | Words in instruction FF memory |
+| `DMEM_DEPTH` | integer | 64 | Words in data FF memory |
+
+Derived localparams:
+- `IMEM_AW = $clog2(IMEM_DEPTH)` — address width for imem index
+- `DMEM_AW = $clog2(DMEM_DEPTH)` — address width for dmem index
+
+---
+
 *End of canonical reference. If a question cannot be answered from this document, flag it as an open design decision.*

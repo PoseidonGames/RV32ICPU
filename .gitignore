@@ -19,6 +19,9 @@ sim/*.log
 # OS
 .DS_Store
 
+# Obsidian local vault config
+.obsidian/
+
 # Archives and extracted build snapshots
 *.zip
 *_extracted/
