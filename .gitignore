@@ -1,6 +1,10 @@
 # Claude Code settings (contains API keys)
 .claude/settings.json
 
+# Private project notes — kept locally, never published
+CLAUDE.md
+docs/
+
 # Simulation artifacts
 sim/*.vcd
 sim/*.vpd
