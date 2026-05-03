@@ -1,0 +1,9 @@
+name: testbench
+
+outputs:
+  - testbench.sv
+  - design.args
+
+commands:
+  - cp tb_datapath_m0.sv outputs/testbench.sv
+  - cp design.args outputs/design.args

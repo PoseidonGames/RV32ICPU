@@ -32,15 +32,15 @@ module regfile_tb;
     logic [31:0] rd_data_b;
 
     regfile dut (
-        .clk       (clk),
-        .rst_n     (rst_n),
-        .wr_en     (wr_en),
-        .wr_addr   (wr_addr),
-        .wr_data   (wr_data),
-        .rd_addr_a (rd_addr_a),
-        .rd_data_a (rd_data_a),
-        .rd_addr_b (rd_addr_b),
-        .rd_data_b (rd_data_b)
+        .clk         (clk),
+        .rst_n       (rst_n),
+        .wr_en_i     (wr_en),
+        .wr_addr_i   (wr_addr),
+        .wr_data_i   (wr_data),
+        .rd_addr_a_i (rd_addr_a),
+        .rd_data_a_o (rd_data_a),
+        .rd_addr_b_i (rd_addr_b),
+        .rd_data_b_o (rd_data_b)
     );
 
     // --------------------------------------------------------
@@ -87,11 +87,11 @@ module regfile_tb;
         input [4:0]  addr,
         input [31:0] data
     );
-        @(posedge clk);
+        @(negedge clk);   // drive at negedge — settled before next posedge captures
         wr_en   = 1'b1;
         wr_addr = addr;
         wr_data = data;
-        @(posedge clk);
+        @(negedge clk);   // wait one full cycle, then deassert
         wr_en   = 1'b0;
     endtask
 
@@ -155,32 +155,33 @@ module regfile_tb;
 
         // ---- Test 5: Write-enable gating ----
         $display("\n--- Test 5: Write-enable gating ---");
-        // Attempt write with wr_en=0
-        @(posedge clk);
+        // Attempt write with wr_en=0 — drive at negedge so posedge sees settled inputs
+        @(negedge clk);
         wr_en   = 1'b0;
         wr_addr = 5'd1;
         wr_data = 32'hFFFFFFFF;
-        @(posedge clk);
+        @(negedge clk);
         rd_addr_a = 5'd1; #1;
         check_port_a("x1 unchanged (wr_en=0)", 32'hCAFEBABE);
 
         // ---- Test 6: Read-during-write returns old value ----
         $display("\n--- Test 6: Read-during-write ---");
-        // Set up: read x3 while writing to x3
-        write_reg(5'd3, 32'hAAAAAAAA);  // first give x3 a known value
+        // Set up: give x3 a known value first
+        write_reg(5'd3, 32'hAAAAAAAA);
 
-        // Now write a new value and read on the same posedge
-        @(posedge clk);
+        // Drive write stimulus at negedge — inputs settled before posedge captures.
+        // The combinational read sees the old FF value (0xAAAAAAAA) until the
+        // posedge actually clocks in 0xBBBBBBBB.
+        @(negedge clk);
         wr_en     = 1'b1;
         wr_addr   = 5'd3;
         wr_data   = 32'hBBBBBBBB;
         rd_addr_a = 5'd3;
-        // Read is combinational, so at posedge it still sees old value
         #1;
         check_port_a("x3 old value during write", 32'hAAAAAAAA);
-        @(posedge clk);
+        // Now let the posedge capture the write, then deassert
+        @(negedge clk);
         wr_en = 1'b0;
-        // Now the new value should be visible
         #1;
         check_port_a("x3 new value after write", 32'hBBBBBBBB);
 

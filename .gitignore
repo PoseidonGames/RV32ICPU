@@ -1,0 +1,43 @@
+# Claude Code settings (contains API keys)
+.claude/settings.json
+
+# Private project notes — kept locally, never published
+CLAUDE.md
+docs/
+
+# Simulation artifacts
+sim/*.vcd
+sim/*.vpd
+sim/*.fsdb
+sim/*.log
+*.vcd
+
+# iverilog compiled sim binaries
+*_sim
+*_tb
+
+# Build artifacts
+*.o
+*.d
+
+# OS
+.DS_Store
+
+# Obsidian local vault config
+.obsidian/
+
+# Archives and extracted build snapshots
+*.zip
+*_extracted/
+gcd_extracted/
+m1_4_13_26_genlibdb/
+
+# Misc build artifacts
+m0_d2_flow_guide.html
+
+# Course materials / screenshots
+*.pdf
+screenshots/
+
+# Local archives / backups
+_archive/

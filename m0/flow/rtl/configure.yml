@@ -1,0 +1,7 @@
+name: rtl
+
+outputs:
+  - design.v
+
+commands:
+  - cat alu.sv regfile.sv imm_gen.sv control_decoder.sv alu_control.sv datapath_m0.sv > outputs/design.v
